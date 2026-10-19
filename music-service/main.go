@@ -47,21 +47,24 @@ func dialMPD(addr string) (*mpdClient, error) {
 	var conn net.Conn
 	var err error
 	for i := 0; i < 3; i++ {
-		conn, err = net.DialTimeout("tcp", addr, 5*time.Second)
+		conn, err = net.DialTimeout("tcp", addr, 2*time.Second)
 		if err == nil {
 			break
 		}
-		time.Sleep(time.Second)
+		time.Sleep(300 * time.Millisecond)
 	}
 	if err != nil {
 		return nil, err
 	}
+	// Дедлайн только на установку сессии (ping), долгие команды raw() не ограничиваем.
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
 	c := &mpdClient{conn: conn, r: bufio.NewReader(conn)}
 	_, err = c.raw("ping")
 	if err != nil {
 		conn.Close()
 		return nil, err
 	}
+	conn.SetDeadline(time.Time{})
 	return c, nil
 }
 
@@ -179,32 +182,91 @@ func parseTrackList(lines []string) []fiber.Map {
 // ——————————————————————————————
 
 var (
-	mpdMu sync.Mutex
-	mpd   *mpdClient
-
-	albumsCache = struct {
-		sync.Mutex
-		data    []fiber.Map
-		expires time.Time
-	}{}
+	mpdMu      sync.Mutex
+	mpd        *mpdClient
+	dialMu     sync.Mutex // сериализует переподключение (один конкурентный диал)
+	mpdDownFor time.Time // backoff после неудачного диала, защита от thundering herd (под dialMu)
 )
 
+// pingTimeout проверяет живость соединения с жёстким дедлайном.
+// Не требует mpdMu; сериализуется собственным mu клиента.
+func (c *mpdClient) pingTimeout(d time.Duration) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_ = c.conn.SetDeadline(time.Now().Add(d))
+	defer c.conn.SetDeadline(time.Time{})
+	if _, err := fmt.Fprintf(c.conn, "ping\n"); err != nil {
+		return false
+	}
+	for {
+		l, err := c.r.ReadString('\n')
+		if err != nil {
+			return false
+		}
+		l = strings.TrimRight(l, "\r\n")
+		if l == "OK" {
+			return true
+		}
+		if strings.HasPrefix(l, "ACK") {
+			return false
+		}
+	}
+}
+
+// mpdReachable — быстрый healthcheck без ретраев и глобального состояния:
+// один dial до 1 с + ping через mpdClient.raw (баннер "OK MPD …" пропускается,
+// ответ ждём до "OK"/"ACK").
+func mpdReachable(addr string) bool {
+	conn, err := net.DialTimeout("tcp", addr, 1*time.Second)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(1 * time.Second))
+	c := &mpdClient{conn: conn, r: bufio.NewReader(conn)}
+	_, err = c.raw("ping")
+	return err == nil
+}
+
+// getMPD возвращает живое соединение с MPD. Инвариант: сетевые операции
+// (ping, dial) выполняются ВНЕ mpdMu — глобальный лок удерживается только на
+// чтение/подмену указателя, поэтому медленный MPD не блокирует остальные хендлеры.
 func getMPD() (*mpdClient, error) {
 	mpdMu.Lock()
-	defer mpdMu.Unlock()
-	if mpd != nil {
-		if _, err := mpd.raw("ping"); err == nil {
-			return mpd, nil
-		}
-		mpd.conn.Close()
-		mpd = nil
+	c := mpd
+	mpdMu.Unlock()
+	if c != nil && c.pingTimeout(2*time.Second) {
+		return c, nil
 	}
-	c, err := dialMPD(platform.GetEnv("MPD_ADDR", "host.containers.internal:6600"))
+	dialMu.Lock()
+	defer dialMu.Unlock()
+	// Кто-то из конкурентов мог уже переподключиться, пока ждали dialMu.
+	mpdMu.Lock()
+	c = mpd
+	mpdMu.Unlock()
+	if c != nil && c.pingTimeout(2*time.Second) {
+		return c, nil
+	}
+	if time.Now().Before(mpdDownFor) {
+		return nil, fmt.Errorf("mpd: temporarily unavailable (backoff)")
+	}
+	if c != nil {
+		mpdMu.Lock()
+		if mpd == c {
+			mpd = nil
+		}
+		mpdMu.Unlock()
+		c.conn.Close()
+	}
+	nc, err := dialMPD(platform.GetEnv("MPD_ADDR", "host.containers.internal:6600"))
 	if err != nil {
+		mpdDownFor = time.Now().Add(2 * time.Second)
 		return nil, err
 	}
-	mpd = c
-	return mpd, nil
+	mpdMu.Lock()
+	mpd = nc
+	mpdMu.Unlock()
+	return nc, nil
 }
 
 // ——————————————————————————————
@@ -376,17 +438,17 @@ func parseAudioInfo(songFile string, status map[string]string) AudioInfo {
 	return info
 }
 
-func albumList() []fiber.Map {
+func albumList() ([]fiber.Map, error) {
 	c, err := getMPD()
 	if err != nil {
-		return []fiber.Map{}
+		return nil, err
 	}
 	lines, err := c.raw("list", "Album", "group", "AlbumArtist")
 	if err != nil {
-		return []fiber.Map{}
+		return nil, err
 	}
 	var cur string
-	albums := []fiber.Map{}
+	albums := []fiber.Map{} // пустой, но валидный список — не ошибка
 	for _, l := range lines {
 		if strings.HasPrefix(l, "AlbumArtist: ") {
 			cur = strings.TrimPrefix(l, "AlbumArtist: ")
@@ -406,50 +468,93 @@ func albumList() []fiber.Map {
 		}
 		return strings.ToLower(albums[i]["album"].(string)) < strings.ToLower(albums[j]["album"].(string))
 	})
-	return albums
+	return albums, nil
 }
 
-func getAlbumsSorted(sortParam string) []fiber.Map {
-	albums := getAlbums()
+// TTL кэша в Redis: список альбомов — 5 минут, треки альбома — 10 минут.
+const (
+	albumsCacheTTL = 5 * time.Minute
+	tracksCacheTTL = 10 * time.Minute
+)
+
+// normalizeAlbumSort приводит параметр сортировки к одному из поддерживаемых
+// значений; неизвестное значение → "artist".
+func normalizeAlbumSort(sortParam string) string {
 	switch sortParam {
+	case "album", "recent", "year_desc", "year_asc":
+		return sortParam
+	default:
+		return "artist"
+	}
+}
+
+// cacheGetJSON читает JSON из Redis (fail-open: ошибка/промах → false).
+func cacheGetJSON(key string, dst any) bool {
+	if rdb == nil {
+		return false
+	}
+	b, err := rdb.Get(ctx, key).Bytes()
+	if err != nil {
+		return false
+	}
+	return json.Unmarshal(b, dst) == nil
+}
+
+// cacheSetJSON кладёт JSON в Redis (fail-open: ошибки игнорируются).
+func cacheSetJSON(key string, v any, ttl time.Duration) {
+	if rdb == nil {
+		return
+	}
+	if b, err := json.Marshal(v); err == nil {
+		_ = rdb.Set(ctx, key, b, ttl).Err()
+	}
+}
+
+func getAlbumsSorted(sortParam string) ([]fiber.Map, error) {
+	sortID := normalizeAlbumSort(sortParam)
+	key := "music:albums:" + sortID
+	var cached []fiber.Map
+	if cacheGetJSON(key, &cached) {
+		return cached, nil
+	}
+	albums, err := albumList()
+	if err != nil {
+		return nil, err
+	}
+	switch sortID {
 	case "album":
-		sorted := append([]fiber.Map{}, albums...)
-		sort.Slice(sorted, func(i, j int) bool {
-			ai := strings.ToLower(sorted[i]["album"].(string))
-			aj := strings.ToLower(sorted[j]["album"].(string))
+		sort.Slice(albums, func(i, j int) bool {
+			ai := strings.ToLower(albums[i]["album"].(string))
+			aj := strings.ToLower(albums[j]["album"].(string))
 			if ai != aj {
 				return ai < aj
 			}
-			return strings.ToLower(sorted[i]["artist"].(string)) < strings.ToLower(sorted[j]["artist"].(string))
+			return strings.ToLower(albums[i]["artist"].(string)) < strings.ToLower(albums[j]["artist"].(string))
 		})
-		return sorted
-	case "recent", "year_desc", "year_asc":
+	case "recent", "year_desc", "year_asc", "artist":
 		// сортировка по году/mtime требует доп. данных — fallback на artist
-		return albums
-	default:
-		return albums
+		// (albumList уже отсортирован по artist).
 	}
+	cacheSetJSON(key, albums, albumsCacheTTL)
+	return albums, nil
 }
 
-func getAlbums() []fiber.Map {
-	albumsCache.Lock()
-	defer albumsCache.Unlock()
-	if time.Now().Before(albumsCache.expires) && albumsCache.data != nil {
-		return albumsCache.data
+func albumTracks(artist, album string) ([]fiber.Map, error) {
+	key := "music:tracks:" + url.QueryEscape(artist) + ":" + url.QueryEscape(album)
+	var cached []fiber.Map
+	if cacheGetJSON(key, &cached) {
+		return cached, nil
 	}
-	albumsCache.data = albumList()
-	albumsCache.expires = time.Now().Add(5 * time.Minute)
-	return albumsCache.data
-}
-
-func albumTracks(artist, album string) []fiber.Map {
 	c, err := getMPD()
 	if err != nil {
-		return []fiber.Map{}
+		return nil, err
 	}
 	lines, err := c.raw("find", "Album", album, "AlbumArtist", artist)
 	if err != nil || len(lines) == 0 {
-		lines, _ = c.raw("find", "Album", album)
+		lines, err = c.raw("find", "Album", album)
+		if err != nil {
+			return nil, err
+		}
 	}
 	tracks := []fiber.Map{}
 	var cur fiber.Map
@@ -491,7 +596,8 @@ func albumTracks(artist, album string) []fiber.Map {
 		tj, _ := strconv.Atoi(tracks[j]["track"].(string))
 		return ti < tj
 	})
-	return tracks
+	cacheSetJSON(key, tracks, tracksCacheTTL)
+	return tracks, nil
 }
 
 func playAlbum(artist, album string) error {
@@ -499,7 +605,7 @@ func playAlbum(artist, album string) error {
 	if err != nil {
 		return err
 	}
-	tracks := albumTracks(artist, album)
+	tracks, _ := albumTracks(artist, album)
 	c.exec("clear")
 	for _, t := range tracks {
 		if f, ok := t["file"].(string); ok {
@@ -639,7 +745,17 @@ func main() {
 	if err := platform.ValidateEnv([]string{"POSTGRES_URL"}); err != nil {
 		log.Fatalf("❌ %v", err)
 	}
-	rdb = redis.NewClient(&redis.Options{Addr: platform.GetEnv("REDIS_ADDR", "localhost:6379")})
+	rdb = redis.NewClient(&redis.Options{
+		Addr:         platform.GetEnv("REDIS_ADDR", "localhost:6379"),
+		DialTimeout:  1 * time.Second,
+		ReadTimeout:  1 * time.Second,
+		WriteTimeout: 1 * time.Second,
+		MaxRetries:   1,
+		// v9.23.0: dialConn имеет собственный цикл ретраев диала с дефолтом
+		// DialerRetries=5 (6 попыток): без явного лимита одна Redis-операция
+		// при недоступном Redis висит ~13 c вместо гарантии «~1 c на попытку».
+		DialerRetries: 1,
+	})
 	bitPerfectEnabled = platform.GetEnv("BIT_PERFECT_ENABLED", "true") == "true"
 	if pgURL := platform.GetEnv("POSTGRES_URL", ""); pgURL != "" {
 		if p, err := pgxpool.New(ctx, pgURL); err != nil {
@@ -667,10 +783,9 @@ func main() {
 	app.Get("/metrics", adaptor.HTTPHandler(promhttp.Handler()))
 
 	app.Get("/health", func(c fiber.Ctx) error {
-		_, err := getMPD()
-		state := "connected"
-		if err != nil {
-			state = "down"
+		state := "down"
+		if mpdReachable(platform.GetEnv("MPD_ADDR", "host.containers.internal:6600")) {
+			state = "connected"
 		}
 		return c.JSON(platform.HealthJSON("music", fiber.Map{"mpd": state}))
 	})
@@ -972,13 +1087,21 @@ func main() {
 
 	app.Get("/albums", func(c fiber.Ctx) error {
 		sortParam := c.Query("sort", "artist")
-		return c.JSON(fiber.Map{"albums": getAlbumsSorted(sortParam)})
+		albums, err := getAlbumsSorted(sortParam)
+		if err != nil || albums == nil {
+			albums = []fiber.Map{}
+		}
+		return c.JSON(fiber.Map{"albums": albums})
 	})
 
 	app.Get("/albums/:artist/:album", func(c fiber.Ctx) error {
 		artist, _ := url.QueryUnescape(c.Params("artist"))
 		album, _ := url.QueryUnescape(c.Params("album"))
-		return c.JSON(fiber.Map{"tracks": albumTracks(artist, album)})
+		tracks, err := albumTracks(artist, album)
+		if err != nil || tracks == nil {
+			tracks = []fiber.Map{}
+		}
+		return c.JSON(fiber.Map{"tracks": tracks})
 	})
 
 	app.Post("/play/album", func(c fiber.Ctx) error {
@@ -991,6 +1114,10 @@ func main() {
 		}
 		if err := playAlbum(b.Artist, b.Album); err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		}
+		// Инвалидация кэша треков альбома после запуска воспроизведения (best-effort).
+		if rdb != nil {
+			_ = rdb.Del(ctx, "music:tracks:"+url.QueryEscape(b.Artist)+":"+url.QueryEscape(b.Album)).Err()
 		}
 		return c.JSON(fiber.Map{"status": "ok"})
 	})
