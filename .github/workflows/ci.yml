@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: nas
+          POSTGRES_PASSWORD: nas_secret
+          POSTGRES_DB: nas_history
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U nas -d nas_history"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+
+      - name: gofmt
+        run: |
+          out=$(gofmt -l . | grep -v vendor || true)
+          if [ -n "$out" ]; then echo "gofmt issues:"; echo "$out"; exit 1; fi
+
+      - name: vet + build + test (все модули)
+        env:
+          TEST_DATABASE_URL: postgres://nas:nas_secret@localhost:5432/nas_history?sslmode=disable
+          REDIS_ADDR: localhost:6379
+        run: make lint build test
+
+  integration:
+    runs-on: ubuntu-latest
+    needs: test
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: nas
+          POSTGRES_PASSWORD: nas_secret
+          POSTGRES_DB: nas_history
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U nas -d nas_history"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+
+      - name: Run integration tests
+        env:
+          TEST_DATABASE_URL: postgres://nas:nas_secret@localhost:5432/nas_history?sslmode=disable
+          REDIS_ADDR: localhost:6379
+        run: |
+          set -e
+          for d in media-service music-service books-service gateway; do
+            echo "=== integration: $d ==="
+            (cd "$d" && go test -tags integration ./... -count=1 -timeout 120s)
+          done

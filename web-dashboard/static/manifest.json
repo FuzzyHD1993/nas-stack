@@ -1,0 +1,11 @@
+{
+  "name": "NAS Dashboard",
+  "short_name": "NAS",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#1e1e2e",
+  "theme_color": "#cba6f7",
+  "icons": [
+    { "src": "/favicon.ico", "sizes": "any", "type": "image/x-icon" }
+  ]
+}

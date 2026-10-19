@@ -1,0 +1,7 @@
+[Unit]
+Description=NAS-stack watchdog (auto-restart unhealthy containers)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/projects/nas-stack/scripts/watchdog.sh

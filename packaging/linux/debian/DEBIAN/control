@@ -1,0 +1,10 @@
+Package: nas-stack
+Version: 1.0.0-beta
+Architecture: all
+Maintainer: konstantin <kostya74ful@gmail.com>
+Depends: podman | docker.io
+Section: utils
+Priority: optional
+Description: NAS Stack — self-hosted NAS management
+ Микросервисное приложение для управления домашним NAS
+ (медиа, музыка, торренты, книги, YouTube, мониторинг).

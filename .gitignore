@@ -1,0 +1,46 @@
+# Go
+*.exe
+*.test
+*.out
+vendor/
+
+# Бинарники сервисов (имя бинарника совпадает с именем директории)
+*/auth-service
+*/gateway
+*/torrent-service
+*/stats-service
+*/scheduler-service
+*/history-service
+*/books-service
+*/search-service
+*/notify-service
+*/web-dashboard
+*/youtube-service
+*/media-service
+*/music-service
+
+# Архивы
+*.tar.gz
+
+# Логи
+*.log
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+
+# Локальные конфиги
+*.local
+.env
+
+# Бинарники
+notify-service/notify-service
+*/notify-service
+*/nas-host-agent
+host-agent/host-agent
+.env.bak*
+*.bak.*
+build/

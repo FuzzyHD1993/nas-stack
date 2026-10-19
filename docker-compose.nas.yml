@@ -1,0 +1,311 @@
+services:
+  redis:
+    image: docker.io/library/redis:7-alpine
+    container_name: nas-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  postgres:
+    image: docker.io/library/postgres:17-alpine
+    container_name: nas-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=nas
+      - POSTGRES_PASSWORD=nas_secret
+      - POSTGRES_DB=nas_history
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nas -d nas_history"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  auth-service:
+    build:
+      context: .
+      dockerfile: auth-service/Dockerfile
+    container_name: nas-auth
+    ports:
+      - "8086:8086"
+    environment:
+      - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
+      - AUTH_PASSWORD=${AUTH_PASSWORD:-admin}
+    restart: unless-stopped
+
+  stats-service:
+    build:
+      context: .
+      dockerfile: stats-service/Dockerfile
+    container_name: nas-stats
+    pid: host
+    ports:
+      - "8082:8082"
+    volumes:
+      - /:/host-root:ro
+      - /volume1/homes/FuzzyHD:/mnt/nas/root/FuzzyHD:ro
+    restart: unless-stopped
+
+  torrent-service:
+    build:
+      context: .
+      dockerfile: torrent-service/Dockerfile
+    container_name: nas-torrent
+    ports:
+      - "8081:8081"
+    environment:
+      - REDIS_ADDR=redis:6379
+      - NAS_HOST=${NAS_HOST:-192.168.0.5}
+      - NAS_USER=${NAS_USER:-FuzzyHD}
+      - NAS_PASS=${NAS_PASS:-}
+      - HOST_IP=${HOST_IP:-}
+      - TORRENT_DESTINATION=${TORRENT_DESTINATION:-homes/FuzzyHD/Music}
+      - TORRENT_DESTINATIONS=${TORRENT_DESTINATIONS:-homes/FuzzyHD/Music,homes/FuzzyHD/Movies,homes/FuzzyHD/TV,homes/FuzzyHD/Games,homes/FuzzyHD/Books,homes/FuzzyHD/Courses,homes/FuzzyHD/Торрентычи}
+      - RUTRACKER_USER=${RUTRACKER_USER}
+      - RUTRACKER_PASS=${RUTRACKER_PASS}
+      - RUTRACKER_USER_ID=${RUTRACKER_USER_ID}
+      - RUTRACKER_COOKIE=${RUTRACKER_COOKIE}
+      - FLARESOLVERR_URL=http://flaresolverr:8191
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  scheduler-service:
+    build:
+      context: .
+      dockerfile: scheduler-service/Dockerfile
+    container_name: nas-scheduler
+    ports:
+      - "8084:8084"
+    environment:
+      - REDIS_ADDR=redis:6379
+      - NOTIFY_SERVICE_URL=http://host.containers.internal:8083
+      - NOTIFY_GATEWAY_TOKEN=${NOTIFY_GATEWAY_TOKEN:-}
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  history-service:
+    build:
+      context: .
+      dockerfile: history-service/Dockerfile
+    container_name: nas-history
+    ports:
+      - "8085:8085"
+    environment:
+      - POSTGRES_URL=postgres://nas:nas_secret@postgres:5432/nas_history?sslmode=disable
+      - REDIS_ADDR=redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  books-service:
+    build:
+      context: .
+      dockerfile: books-service/Dockerfile
+    container_name: nas-books
+    ports:
+      - "8087:8087"
+    environment:
+      - FLIBUSTA_URL=${FLIBUSTA_URL:-https://flibusta.is}
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - BOOKS_DIR=/books
+    volumes:
+      - /volume1/video/Books:/books
+    restart: unless-stopped
+
+  youtube-service:
+    build:
+      context: .
+      dockerfile: youtube-service/Dockerfile
+    container_name: nas-youtube
+    ports:
+      - "8089:8089"
+    environment:
+      - REDIS_ADDR=redis:6379
+      - YOUTUBE_DIR=/youtube
+      - POT_PROVIDER_URL=http://host.containers.internal:4416
+    volumes:
+      - /volume1/homes/FuzzyHD/YT_video:/youtube
+    extra_hosts:
+      - "host.containers.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  media-service:
+    build:
+      context: .
+      dockerfile: media-service/Dockerfile
+    container_name: nas-media
+    ports:
+      - "8091:8091"
+    environment:
+      - POSTGRES_URL=postgres://nas:nas_secret@postgres:5432/nas_history?sslmode=disable
+      - REDIS_ADDR=redis:6379
+      - TMDB_API_KEY=${TMDB_API_KEY}
+      - TMDB_LANG=ru-RU
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
+      - MEDIA_MOVIES_DIR=/movies
+      - MEDIA_TV_DIR=/tv
+      - MEDIA_MOVIES_HOST_DIR=/volume1/homes/FuzzyHD/Movies
+      - MEDIA_TV_HOST_DIR=/volume1/homes/FuzzyHD/TV
+      - BOOKS_OPENER_URL=http://host.containers.internal:9999
+    volumes:
+      - /volume1/homes/FuzzyHD/Movies:/movies:ro
+      - /volume1/homes/FuzzyHD/TV:/tv:ro
+    extra_hosts:
+      - "api.themoviedb.org:143.204.238.23"
+      - "image.tmdb.org:185.59.220.199"
+      - "www.themoviedb.org:143.204.238.23"
+      - "host.containers.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  music-service:
+    build:
+      context: .
+      dockerfile: music-service/Dockerfile
+    container_name: nas-music
+    ports:
+      - "8092:8092"
+    environment:
+      - MPD_ADDR=${MPD_ADDR:-host.containers.internal:6600}
+      - MUSIC_DIR=/mnt/nas/root/FuzzyHD/Music
+      - REDIS_ADDR=redis:6379
+    volumes:
+      - /volume1/homes/FuzzyHD:/mnt/nas/root/FuzzyHD:ro
+    extra_hosts:
+      - "host.containers.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+
+  gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    container_name: nas-gateway
+    extra_hosts:
+      - "host.containers.internal:host-gateway"
+    ports:
+      - "8080:8080"
+    environment:
+      - STATS_SERVICE_URL=http://stats-service:8082
+      - TORRENT_SERVICE_URL=http://torrent-service:8081
+      - SCHEDULER_SERVICE_URL=http://scheduler-service:8084
+      - HISTORY_SERVICE_URL=http://history-service:8085
+      - NOTIFY_SERVICE_URL=http://host.containers.internal:8083
+      - AUTH_SERVICE_URL=http://auth-service:8086
+      - BOOKS_SERVICE_URL=http://books-service:8087
+      - SEARCH_SERVICE_URL=http://search-service:8088
+      - YOUTUBE_SERVICE_URL=http://youtube-service:8089
+      - MEDIA_SERVICE_URL=http://media-service:8091
+      - MUSIC_SERVICE_URL=http://music-service:8092
+      - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
+      - AUTH_ENABLED=${AUTH_ENABLED:-false}
+      - NOTIFY_GATEWAY_TOKEN=${NOTIFY_GATEWAY_TOKEN:-}
+      # ADMIN_TOKEN: без него gateway ПАДАЕТ на старте — host-exec закрыт.
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
+    depends_on:
+      - stats-service
+      - torrent-service
+      - scheduler-service
+      - history-service
+      - auth-service
+      - books-service
+    restart: unless-stopped
+
+  web-dashboard:
+    build:
+      context: .
+      dockerfile: web-dashboard/Dockerfile
+    container_name: nas-dashboard
+    ports:
+      - "8090:8090"
+    environment:
+      - GATEWAY_URL=http://gateway:8080
+    depends_on:
+      - gateway
+    restart: unless-stopped
+
+  flaresolverr:
+    image: docker.io/flaresolverr/flaresolverr:latest
+    container_name: nas-flaresolverr
+    ports:
+      - "8191:8191"
+    environment:
+      - LOG_LEVEL=info
+      - TZ=Asia/Novosibirsk
+    restart: unless-stopped
+
+  prowlarr:
+    image: docker.io/linuxserver/prowlarr:latest
+    container_name: nas-prowlarr
+    ports:
+      - "9696:9696"
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Asia/Novosibirsk
+    volumes:
+      - prowlarr-config:/config
+    depends_on:
+      - flaresolverr
+    restart: unless-stopped
+
+  prometheus:
+    image: docker.io/prom/prometheus:latest
+    container_name: nas-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    restart: unless-stopped
+
+  grafana:
+    image: docker.io/grafana/grafana:latest
+    container_name: nas-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SECURITY_ALLOW_EMBEDDING=true
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  prowlarr-config:
+  prometheus-data:
+  grafana-data:

@@ -1,0 +1,168 @@
+diff --git a/application/archive.php b/application/archive.php
+new file mode 100644
+index 0000000..8a187f3
+--- /dev/null
++++ b/application/archive.php
+@@ -0,0 +1,19 @@
++<?php
++// Универсальное чтение файла из .zip и .7z (FLibrary-дистрибутив).
++function archive_extract($archive, $entry) {
++    if (!$archive || !is_file($archive)) return false;
++    $ext = strtolower(pathinfo($archive, PATHINFO_EXTENSION));
++    if ($ext === 'zip') {
++        $zip = new ZipArchive();
++        if ($zip->open($archive) !== true) return false;
++        $data = $zip->getFromName($entry);
++        $zip->close();
++        return $data;
++    }
++    if ($ext === '7z') {
++        $cmd = '7z e -so ' . escapeshellarg($archive) . ' ' . escapeshellarg($entry) . ' 2>/dev/null';
++        $data = shell_exec($cmd);
++        return ($data === null || $data === '') ? false : $data;
++    }
++    return false;
++}
+diff --git a/application/modules/book/fb.php b/application/modules/book/fb.php
+index 4b84e0c..fa16349 100644
+--- a/application/modules/book/fb.php
++++ b/application/modules/book/fb.php
+@@ -33,7 +33,8 @@ if ($user_uuid != "") {
+ 
+ 
+ $content = '';
+-$data = $zip->getFromName("$url->var1.fb2");
++require_once(__DIR__ . '/../../archive.php');
++$data = archive_extract($archive_path ?? '', "$url->var1.fb2");
+ 
+ $fb2 = simplexml_load_string($data);
+ echo ($fb2 ? '' : 'FB2 Parse Error'), PHP_EOL;
+diff --git a/application/modules/book/index.php b/application/modules/book/index.php
+index 22564eb..ece4203 100644
+--- a/application/modules/book/index.php
++++ b/application/modules/book/index.php
+@@ -43,9 +43,10 @@ if ($ext == 'fb2') {
+ $stmt->execute();
+ $zip_name = $stmt->fetch()->filename;
+ $zip = new ZipArchive(); 
++$archive_path = ROOT_PATH . "flibusta/" . $zip_name;
+ 
+ echo "<div id='reader' class='reader'>";
+-if ($zip->open(ROOT_PATH . "flibusta/" . $zip_name)) {
++if (substr($archive_path, -3) === '.7z' ? is_file($archive_path) : $zip->open($archive_path)) {
+ 	if ($ext == 'fb2') {
+ 		include('fb.php');
+ 	}
+@@ -82,7 +83,9 @@ if ($zip->open(ROOT_PATH . "flibusta/" . $zip_name)) {
+ 		include('html.php');
+ 	}
+ 
+-	$zip->close();
++	if (substr($archive_path, -3) !== '.7z') {
++		$zip->close();
++	}
+ }
+ 
+ 
+diff --git a/application/public/fb2.php b/application/public/fb2.php
+index ea84a37..d7e7180 100644
+--- a/application/public/fb2.php
++++ b/application/public/fb2.php
+@@ -24,10 +24,12 @@ $book = $stmt->fetch();
+ 
+ $stmt = $dbh->prepare("SELECT * FROM book_zip WHERE $id BETWEEN start_id AND end_id AND usr=0");
+ $stmt->execute();
+-$zip_name = $stmt->fetch()->filename;
+-$zip = new ZipArchive();
++$row = $stmt->fetch();
++$zip_name = $row ? $row->filename : '';
++require_once(__DIR__ . '/../archive.php');
++$data = archive_extract(ROOT_PATH . "flibusta/" . $zip_name, "$id.fb2");
+ 
+-if ($zip->open(ROOT_PATH . "flibusta/" . $zip_name)) {
++if ($data !== false) {
+ 	$filename = $book->author_name . " - " . $book->booktitle . " " . $id . ".fb2";
+ 	header('Content-Description: File Transfer');
+ 	header('Content-Type: application/octet-stream');
+@@ -36,8 +38,7 @@ if ($zip->open(ROOT_PATH . "flibusta/" . $zip_name)) {
+ 	header('Expires: 0');
+ 	header('Cache-Control: must-revalidate');
+ 	header('Pragma: public');
+-	echo $zip->getFromName("$id.fb2");
+-	$zip->close();
++	echo $data;
+ } else {
+ 	echo "NO ZIP";
+ }
+diff --git a/application/tools/app_update_zip_list.php b/application/tools/app_update_zip_list.php
+index f43eed4..a03283b 100755
+--- a/application/tools/app_update_zip_list.php
++++ b/application/tools/app_update_zip_list.php
+@@ -1,36 +1,24 @@
+ <?php
+ error_reporting(E_ALL);
+-include('../dbinit.php');
++include(__DIR__ . '/../dbinit.php');
+ 
+-if ($handle = opendir('/application/flibusta')) {
+-	$stmt = $dbh->prepare("TRUNCATE book_zip;");
+-	$stmt->execute();
++$stmt = $dbh->prepare("TRUNCATE book_zip;");
++$stmt->execute();
++$insert = $dbh->prepare("INSERT INTO book_zip (filename, start_id, end_id, usr) VALUES (:fn, :start, :end, :usr)");
+ 
+-	$dbh->beginTransaction();
+-
+-	while (false !== ($entry = readdir($handle))) {   
+-		if (strpos($entry, "-") !== false && strpos($entry, ".zip") !== false && substr($entry, -9) !== ".zip.part") {
+-        		$dt = str_replace(".zip", "", $entry);
+-		        $dt = str_replace("f.n.", "f.n-", $dt);
+-        		$dt = str_replace("f.fb2.", "f.n-", $dt);
+-			echo "[$dt]";
+-		        $fn = explode("-", $dt);
+-			$u = 1;
+-			if (strpos($entry, "fb2") !== false) {
+-				$u = 0;
+-			}
+-			if (strpos($entry, "d.fb2-009") !== false) {
+-			} else {
+-				$stmt = $dbh->prepare("INSERT INTO book_zip (filename, start_id, end_id, usr) VALUES (:fn, :start, :end, :usr)");
+-				$stmt->bindParam(":fn", $entry);
+-				$stmt->bindParam(":start", $fn[1]);
+-				$stmt->bindParam(":end", $fn[2]);
+-				$stmt->bindParam(":usr", $u);
+-				$stmt->execute();
+-			}
+-		}
+-		echo "\n";
+-	}
+-	$dbh->commit();
+-	closedir($handle);
++// .7z — тексты книг (usr=0); images/*.zip — иллюстрации/обложки (usr=1).
++$dir = '/application/flibusta';
++$n = 0;
++foreach (scandir($dir) ?: [] as $entry) {
++    if (preg_match('/^(?:f\.)?fb2-(\d+)-(\d+)\.7z$/', $entry, $m)) {
++        $insert->execute([':fn' => $entry, ':start' => $m[1], ':end' => $m[2], ':usr' => 0]);
++        $n++;
++    }
++}
++foreach (scandir($dir . '/images') ?: [] as $entry) {
++    if (preg_match('/^(?:f\.)?fb2-(\d+)-(\d+)\.zip$/', $entry, $m)) {
++        $insert->execute([':fn' => 'images/' . $entry, ':start' => $m[1], ':end' => $m[2], ':usr' => 1]);
++        $n++;
++    }
+ }
++echo "indexed=$n\n";
+diff --git a/phpdocker/php-fpm/Dockerfile b/phpdocker/php-fpm/Dockerfile
+index 228fb7e..f5a4dfe 100644
+--- a/phpdocker/php-fpm/Dockerfile
++++ b/phpdocker/php-fpm/Dockerfile
+@@ -6,5 +6,6 @@ WORKDIR "/application"
+ 
+ RUN apk --update add postgresql-client;\
+   apk add python3;\
+-  apk add coreutils;
++  apk add coreutils;\
++  apk add p7zip;
+ RUN chmod +x /usr/local/bin/install-php-extensions; install-php-extensions gd bz2 pdo_pgsql zip

@@ -1,0 +1,10 @@
+# Go
+*.exe
+*.test
+*.out
+/nas-host-agent
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,42 @@
+name: Build Installers
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build .deb
+        run: sudo apt-get update && sudo apt-get install -y dpkg-dev && bash scripts/build-deb.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: build/*.deb
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Inno Setup
+        run: choco install innosetup -y
+      - name: Build installer
+        run: iscc packaging/windows/nas-stack.iss
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: build/*.exe
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build DMG
+        run: bash scripts/build-macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: build/*.dmg

@@ -1,0 +1,16 @@
+# Go
+*.exe
+*.test
+*.out
+vendor/
+
+# Бинарник
+nas-books-opener
+books-opener
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store

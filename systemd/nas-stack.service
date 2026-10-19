@@ -1,0 +1,18 @@
+[Unit]
+Description=NAS-Stack (podman compose)
+After=network-online.target podman.socket
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=%h/projects/nas-stack
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/lib/docker/cli-plugins
+ExecStart=/usr/bin/bash %h/projects/nas-stack/scripts/start-stack.sh
+ExecStop=/usr/bin/podman compose down
+# На старте скрипт ждёт NAS и health-check'и; 300s мало для холодной загрузки.
+TimeoutStartSec=600
+TimeoutStopSec=180
+
+[Install]
+WantedBy=default.target

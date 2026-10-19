@@ -1,0 +1,780 @@
+services:
+  redis:
+    image: docker.io/library/redis:7-alpine
+    container_name: nas-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '1.0'
+    logging:
+      driver: journald
+      options:
+        tag: "{{.Name}}"
+
+  postgres:
+    image: docker.io/library/postgres:17-alpine
+    container_name: nas-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=nas
+      - POSTGRES_PASSWORD=nas_secret
+      - POSTGRES_DB=nas_history
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nas -d nas_history"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '2.0'
+    logging:
+      driver: journald
+      options:
+        tag: "{{.Name}}"
+
+  auth-service:
+    build:
+      context: .
+      dockerfile: auth-service/Dockerfile
+    container_name: nas-auth
+    ports:
+      - "8086:8086"
+    environment:
+      - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
+      - AUTH_PASSWORD=${AUTH_PASSWORD:-admin}
+      - POSTGRES_URL=postgres://nas:nas_secret@postgres:5432/nas_history?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.5'
+    logging:
+      driver: journald
+      options:
+        tag: "{{.Name}}"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8086/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  stats-service:
+    build:
+      context: .
+      dockerfile: stats-service/Dockerfile
+    container_name: nas-stats
+    pid: host
+    ports:
+      - "8082:8082"
+    environment:
+      - REDIS_ADDR=redis:6379
+      - DISK_WATCH_INTERVAL_MIN=${DISK_WATCH_INTERVAL_MIN:-30}
+      - DISK_WARN_PERCENT=${DISK_WARN_PERCENT:-80}
+      - DISK_CRIT_PERCENT=${DISK_CRIT_PERCENT:-90}
+      # Тот же ADMIN_TOKEN, что и у host-agent: /cleanup/run — host-exec.
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
+      - HOST_AGENT_URL=http://host.containers.internal:9998
+    volumes:
+      - /:/host-root:ro
+      - ${NAS_ROOT:-/mnt/nas}:/mnt/nas:ro
+    extra_hosts:
+      - "host.containers.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.5'
+    logging:
+      driver: journald
+      options:
+        tag: "{{.Name}}"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8082/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  torrent-service:
+    build:
+      context: .
+      dockerfile: torrent-service/Dockerfile
+    container_name: nas-torrent
+    ports:
+      - "8081:8081"
+    environment:
+      - REDIS_ADDR=redis:6379
+      - NAS_HOST=${NAS_HOST:-192.168.0.5}
+      - NAS_USER=${NAS_USER:-FuzzyHD}
+      - NAS_PASS=${NAS_PASS:-}
+      - HOST_IP=${HOST_IP:-}
+      - TORRENT_DESTINATION=${TORRENT_DESTINATION:-homes/FuzzyHD/Music}
+      - TORRENT_DESTINATIONS=${TORRENT_DESTINATIONS:-homes/FuzzyHD/Music,homes/FuzzyHD/Movies,homes/FuzzyHD/TV,homes/FuzzyHD/Games,homes/FuzzyHD/Books,homes/FuzzyHD/Courses,homes/FuzzyHD/Торрентычи}
+      - RUTRACKER_USER=${RUTRACKER_USER}
+      - RUTRACKER_PASS=${RUTRACKER_PASS}
+      - RUTRACKER_USER_ID=${RUTRACKER_USER_ID}
+      - RUTRACKER_COOKIE=${RUTRACKER_COOKIE}
+      - FLARESOLVERR_URL=http://flaresolverr:8191
+      - FLARESOLVERR_TIMEOUT=${FLARESOLVERR_TIMEOUT:-120000}
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '1.0'
+    logging:
+      driver: journald
+      options:
+        tag: "{{.Name}}"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8081/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  scheduler-service:
+    build:
+      context: .
+      dockerfile: scheduler-service/Dockerfile
+    container_name: nas-scheduler
+    ports:
+      - "8084:8084"
+    environment:
+      - REDIS_ADDR=redis:6379
+      - POSTGRES_URL=postgres://nas:nas_secret@postgres:5432/nas_history?sslmode=disable
+      - BACKUP_DIR=/backups/postgres
+      - BACKUP_KEEP=${BACKUP_KEEP:-7}
+      - MEDIA_SERVICE_URL=http://media-service:8091
+      - NOTIFY_SERVICE_URL=http://host.containers.internal:8083
+      - NOTIFY_GATEWAY_TOKEN=${NOTIFY_GATEWAY_TOKEN:-}
+      # ADMIN_TOKEN: проверка клиента на POST /update/run и проброс
+      # host-agent'у (он закрыл /update/run, /cleanup/run, /duplicates/resolve).
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
+      - HOST_AGENT_URL=http://host.containers.internal:9998
+      - PROWLARR_URL=http://host.containers.internal:9696
+      - PROWLARR_API_KEY=${PROWLARR_API_KEY:-}
+      - NAS_HOST=${NAS_HOST:-192.168.0.5}
+      - NAS_USER=${NAS_USER:-FuzzyHD}
+      - NAS_SSH_PORT=${NAS_SSH_PORT:-5022}
+      - NAS_SSH_KEY=/root/.ssh/id_ed25519
+      - NAS_BACKUP_SCRIPT=${NAS_BACKUP_SCRIPT:-/volume1/docker/gitea-backups/backup-gitea.sh}
+      - NAS_PASS=${NAS_PASS:-}
+    volumes:
+      - ${BACKUP_HOST_DIR:-/mnt/nas/Backups}:/backups
+      # Отдельный ключ scheduler-service; создаётся в named volume.
+      - scheduler_ssh:/root/.ssh
+    extra_hosts:
+      - "host.containers.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.5'
+    logging:
+      driver: journald
+      options:
+        tag: "{{.Name}}"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8084/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  history-service:
+    build:
+      context: .
+      dockerfile: history-service/Dockerfile
+    container_name: nas-history
+    ports:
+      - "8085:8085"
+    environment:
+      - POSTGRES_URL=postgres://nas:nas_secret@postgres:5432/nas_history?sslmode=disable
+      - REDIS_ADDR=redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.5'
+    logging:
+      driver: journald
+      options:
+        tag: "{{.Name}}"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8085/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  books-service:
+    build:
+      context: .
+      dockerfile: books-service/Dockerfile
+    container_name: nas-books
+    ports:
+      - "8087:8087"
+    environment:
+      - FLIBUSTA_URL=${FLIBUSTA_URL:-https://flibusta.is}
+      - FLIBUSTA_LOCAL_URL=${FLIBUSTA_LOCAL_URL:-}
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - BOOKS_DIR=/books
+    volumes:
+      - ${BOOKS_HOST_DIR:-/mnt/nas/Books}:/books
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.5'
+    logging:
+      driver: journald
+      options:
+        tag: "{{.Name}}"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8087/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  search-service:
+    build:
+      context: .
+      dockerfile: search-service/Dockerfile
+    container_name: nas-search
+    extra_hosts:
+      - "host.containers.internal:host-gateway"
+    ports:
+      - "8088:8088"
+    environment:
+      - PROWLARR_URL=http://host.containers.internal:9696
+      - PROWLARR_API_KEY=${PROWLARR_API_KEY}
+      - REDIS_ADDR=redis:6379
+    depends_on:
+      - prowlarr
+      - redis
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '1.0'
+    logging:
+      driver: journald
+      options:
+        tag: "{{.Name}}"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8088/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  youtube-service:
+    build:
+      context: .
+      dockerfile: youtube-service/Dockerfile
+    container_name: nas-youtube
+    ports:
+      - "8089:8089"
+    environment:
+      - REDIS_ADDR=redis:6379
+      - YOUTUBE_DIR=/youtube
+      - POT_PROVIDER_URL=http://host.containers.internal:4416
+    volumes:
+      - ${YOUTUBE_HOST_DIR:-/mnt/nas/YT_video}:/youtube
+    extra_hosts:
+      - "host.containers.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '2.0'
+    logging:
+      driver: journald
+      options:
+        tag: "{{.Name}}"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8089/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  media-service:
+    build:
+      context: .
+      dockerfile: media-service/Dockerfile
+    container_name: nas-media
+    ports:
+      - "8091:8091"
+    environment:
+      - POSTGRES_URL=postgres://nas:nas_secret@postgres:5432/nas_history?sslmode=disable
+      - REDIS_ADDR=redis:6379
+      - TMDB_API_KEY=${TMDB_API_KEY}
+      - TMDB_LANG=ru-RU
+      - MEDIA_MOVIES_DIR=/movies
+      - MEDIA_TV_DIR=/tv
+      - MEDIA_PHOTOS_DIR=/photos
+      - PHOTO_CACHE_DIR=/var/cache/nas-photos
+      - PHOTO_FULL_SIZE=${PHOTO_FULL_SIZE:-1200}
+      - MEDIA_MOVIES_HOST_DIR=${MEDIA_MOVIES_HOST_DIR:-/mnt/nas/root/FuzzyHD/Movies}
+      - MEDIA_TV_HOST_DIR=${MEDIA_TV_HOST_DIR:-/mnt/nas/root/FuzzyHD/TV}
+      - MEDIA_WATCH_ENABLED=${MEDIA_WATCH_ENABLED:-true}
+      - MEDIA_WATCH_DEBOUNCE_SEC=${MEDIA_WATCH_DEBOUNCE_SEC:-3}
+      - MEDIA_WATCH_POLL_SEC=${MEDIA_WATCH_POLL_SEC:-20}
+      - TRANSCODE_VIDEO_ENABLED=${TRANSCODE_VIDEO_ENABLED:-true}
+      - TRANSCODE_ENCODER=${TRANSCODE_ENCODER:-auto}
+      - TRANSCODE_PRESET=${TRANSCODE_PRESET:-veryfast}
+      - TRANSCODE_CRF=${TRANSCODE_CRF:-23}
+      - SEARCH_SERVICE_URL=http://search-service:8088
+      - TORRENT_SERVICE_URL=http://torrent-service:8081
+      - BOOKS_OPENER_URL=http://host.containers.internal:9999
+      # Тот же ADMIN_TOKEN, что и у host-agent: /duplicates/resolve переносит файлы.
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
+      - HOST_AGENT_URL=http://host.containers.internal:9998
+    volumes:
+      - ${MEDIA_MOVIES_HOST_DIR:-/mnt/nas/root/FuzzyHD/Movies}:/movies:ro
+      - ${MEDIA_TV_HOST_DIR:-/mnt/nas/root/FuzzyHD/TV}:/tv:ro
+      - ${MEDIA_PHOTOS_HOST_DIR:-/mnt/nas/root/FuzzyHD/Photos}:/photos:ro
+      - photo-cache:/var/cache/nas-photos
+    extra_hosts:
+      - "api.themoviedb.org:${TMDB_API_IP:-143.204.238.23}"
+      - "image.tmdb.org:${TMDB_IMG_IP:-185.59.220.199}"
+      - "www.themoviedb.org:${TMDB_API_IP:-143.204.238.23}"
+      - "host.containers.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '2.0'
+    logging:
+      driver: journald
+      options:
+        tag: "{{.Name}}"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8091/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  music-service:
+    build:
+      context: .
+      dockerfile: music-service/Dockerfile
+    container_name: nas-music
+    ports:
+      - "8092:8092"
+    environment:
+      - MPD_ADDR=${MPD_ADDR:-host.containers.internal:6600}
+      - MUSIC_DIR=${MUSIC_HOST_DIR:-/mnt/nas/root/FuzzyHD/Music}
+      - REDIS_ADDR=redis:6379
+      - POSTGRES_URL=postgres://nas:nas_secret@postgres:5432/nas_history?sslmode=disable
+      - BIT_PERFECT_ENABLED=${BIT_PERFECT_ENABLED:-true}
+    volumes:
+      - ${NAS_ROOT:-/mnt/nas}:/mnt/nas:ro
+    extra_hosts:
+      - "host.containers.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '1.0'
+    logging:
+      driver: journald
+      options:
+        tag: "{{.Name}}"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8092/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    container_name: nas-gateway
+    extra_hosts:
+      - "host.containers.internal:host-gateway"
+    ports:
+      - "8080:8080"
+    environment:
+      - STATS_SERVICE_URL=http://stats-service:8082
+      - TORRENT_SERVICE_URL=http://torrent-service:8081
+      - SCHEDULER_SERVICE_URL=http://scheduler-service:8084
+      - HISTORY_SERVICE_URL=http://history-service:8085
+      - NOTIFY_SERVICE_URL=http://host.containers.internal:8083
+      - AUTH_SERVICE_URL=http://auth-service:8086
+      - BOOKS_SERVICE_URL=http://books-service:8087
+      - SEARCH_SERVICE_URL=http://search-service:8088
+      - YOUTUBE_SERVICE_URL=http://youtube-service:8089
+      - MEDIA_SERVICE_URL=http://media-service:8091
+      - MUSIC_SERVICE_URL=http://music-service:8092
+      - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
+      - AUTH_ENABLED=${AUTH_ENABLED:-false}
+      - NOTIFY_GATEWAY_TOKEN=${NOTIFY_GATEWAY_TOKEN:-}
+      # ADMIN_TOKEN: без него gateway ПАДАЕТ на старте — host-exec ручки
+      # (/notify/update/*, /notify/env*, /scheduler/update/*) закрыты.
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
+    depends_on:
+      - stats-service
+      - torrent-service
+      - scheduler-service
+      - history-service
+      - auth-service
+      - books-service
+      - search-service
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '1.0'
+    logging:
+      driver: journald
+      options:
+        tag: "{{.Name}}"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  web-dashboard:
+    build:
+      context: .
+      dockerfile: web-dashboard/Dockerfile
+    container_name: nas-dashboard
+    ports:
+      - "8090:8090"
+    environment:
+      - GATEWAY_URL=http://gateway:8080
+      - SCHEDULER_URL=http://scheduler-service:8084
+      - ENV_PATH=/app/.env
+      - SETUP_AUTO_REDIRECT=${SETUP_AUTO_REDIRECT:-false}
+      - NAS_TYPE=${NAS_TYPE:-generic-linux}
+      - CONTAINER_RUNTIME=${CONTAINER_RUNTIME:-podman}
+      - HAS_SYSTEMD=${HAS_SYSTEMD:-true}
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+    volumes:
+      - ${ENV_FILE:-./.env}:/app/.env:rw
+      - ${NAS_ROOT:-/mnt/nas}:/mnt/nas:ro
+    depends_on:
+      - gateway
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.5'
+    logging:
+      driver: journald
+      options:
+        tag: "{{.Name}}"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8090/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  ntfy:
+    image: docker.io/binwiederhier/ntfy:latest
+    container_name: nas-ntfy
+    command: serve
+    ports:
+      - "2586:80"
+    environment:
+      - NTFY_BASE_URL=${NTFY_BASE_URL:-http://192.168.0.4:2586}
+      - NTFY_CACHE_FILE=/var/cache/ntfy/cache.db
+      - NTFY_AUTH_DEFAULT_ACCESS=deny-all
+      - NTFY_BEHIND_PROXY=false
+    volumes:
+      - ntfy-cache:/var/cache/ntfy
+    restart: unless-stopped
+
+  flaresolverr:
+    image: docker.io/flaresolverr/flaresolverr:latest
+    container_name: nas-flaresolverr
+    ports:
+      - "8191:8191"
+    environment:
+      - LOG_LEVEL=info
+      - TZ=${TZ:-Asia/Novosibirsk}
+    restart: unless-stopped
+
+  prowlarr:
+    image: docker.io/linuxserver/prowlarr:latest
+    container_name: nas-prowlarr
+    network_mode: host
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ:-Asia/Novosibirsk}
+    volumes:
+      - prowlarr-config:/config
+    depends_on:
+      - flaresolverr
+    restart: unless-stopped
+
+  prometheus:
+    image: docker.io/prom/prometheus:latest
+    container_name: nas-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    extra_hosts:
+      - "host.containers.internal:host-gateway"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+    logging:
+      driver: journald
+      options:
+        tag: "{{.Name}}"
+
+  grafana:
+    image: docker.io/grafana/grafana:11.3.0
+    container_name: nas-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SECURITY_ALLOW_EMBEDDING=true
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+    logging:
+      driver: journald
+      options:
+        tag: "{{.Name}}"
+
+  # === Хост-демоны для систем без systemd (Synology/QNAP/macOS) ===
+  host-agent:
+    build:
+      context: .
+      dockerfile: host-agent/Dockerfile
+    container_name: nas-host-agent
+    pid: host
+    privileged: true
+    ports:
+      - "9998:9998"
+    environment:
+      - LIBRARY_ROOT=${LIBRARY_ROOT:-/mnt/nas/root/FuzzyHD}
+      - DUPLICATES_BACKUP_DIR=${DUPLICATES_BACKUP_DIR:-/mnt/nas/Backups/duplicates}
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
+      # В контейнерном профиле агент слушает 0.0.0.0 (иначе до него не достучаться
+      # с других контейнеров); host-exec ручки всё равно закрыты ADMIN_TOKEN.
+      - HOST_AGENT_BIND=0.0.0.0:9998
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host-root:ro
+      - ${NAS_ROOT:-/mnt/nas}:/mnt/nas:ro
+      - ${CONTAINER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+    restart: unless-stopped
+    profiles: ["nas-non-systemd"]
+
+  books-opener:
+    build:
+      context: .
+      dockerfile: books-opener/Dockerfile
+    container_name: nas-books-opener-docker
+    ports:
+      - "9999:9999"
+    environment:
+      - LIBRARY_ROOT=${LIBRARY_ROOT:-/mnt/nas/root/FuzzyHD}
+    volumes:
+      - ${NAS_ROOT:-/mnt/nas}:/mnt/nas:ro
+    restart: unless-stopped
+    profiles: ["nas-non-systemd"]
+
+  notify:
+    build:
+      context: .
+      dockerfile: notify-service/Dockerfile
+    container_name: nas-notify-docker
+    ports:
+      - "8083:8083"
+    environment:
+      - REDIS_ADDR=redis:6379
+      - NTFY_URL=${NTFY_URL:-}
+      - NTFY_TOPIC=${NTFY_TOPIC:-nas-alerts}
+      - NTFY_TOKEN=${NTFY_TOKEN:-}
+      - NAS_STACK_DIR=/app
+      - NOTIFY_GATEWAY_TOKEN=${NOTIFY_GATEWAY_TOKEN:-}
+    extra_hosts:
+      - "host.containers.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    profiles: ["nas-non-systemd"]
+
+
+  # === Локальное зеркало Флибусты (опционально, профиль flibusta-local) ===
+  # Образ ghcr.io/zlsl/flibusta не публикуется — собираем из исходников.
+  # Исходники: git clone https://github.com/zlsl/flibusta.git ../flibusta-mirror
+  flibusta-db:
+    build: ${FLIBUSTA_SRC_DIR:-../flibusta-mirror}/phpdocker/pg
+    image: nas-stack-flibusta-db:local
+    container_name: nas-flibusta-db
+    environment:
+      - POSTGRES_USER=flibusta
+      - POSTGRES_PASSWORD=${FLIBUSTA_DB_PASSWORD:-flibusta}
+      - POSTGRES_DB=flibusta
+    volumes:
+      - flibusta-db-data:/var/lib/postgresql/data
+    restart: unless-stopped
+    profiles: ["flibusta-local"]
+
+  flibusta-php:
+    build: ${FLIBUSTA_SRC_DIR:-../flibusta-mirror}/phpdocker/php-fpm
+    image: nas-stack-flibusta-php:local
+    container_name: nas-flibusta-php
+    # rootless podman: uid 82 (www-data) внутри = uid 1000 на хосте (CIFS)
+    userns_mode: "keep-id:uid=82,gid=82"
+    working_dir: /application
+    volumes:
+      - ${FLIBUSTA_SRC_DIR:-../flibusta-mirror}/application:/application
+      - ${FLIBUSTA_DATA_DIR:-/mnt/nas/root/FuzzyHD/flibusta-data}/cache:/application/cache
+      - ${FLIBUSTA_ARCHIVES_DIR:-/mnt/nas/root/FuzzyHD/flibusta-data/Flibusta.Net}:/application/flibusta:ro
+      - ${FLIBUSTA_DATA_DIR:-/mnt/nas/root/FuzzyHD/flibusta-data}/FlibustaSQL:/application/sql
+      - ${FLIBUSTA_DATA_DIR:-/mnt/nas/root/FuzzyHD/flibusta-data}/secrets/flibusta_pwd.txt:/run/secrets/FLIBUSTA_PWD:ro
+      - ${FLIBUSTA_SRC_DIR:-../flibusta-mirror}/phpdocker/php-fpm/php-ini-overrides.ini:/usr/local/etc/php/conf.d/local-custom.ini:ro
+      - ${FLIBUSTA_SRC_DIR:-../flibusta-mirror}/phpdocker/php-fpm/php-fpm.conf:/usr/local/etc/php-fpm.d/zz-php-fpm.conf:ro
+    environment:
+      - FLIBUSTA_DBUSER=flibusta
+      - FLIBUSTA_DBNAME=flibusta
+      - FLIBUSTA_DBTYPE=postgres
+      - FLIBUSTA_DBHOST=flibusta-db
+      - FLIBUSTA_DBPASSWORD_FILE=/run/secrets/FLIBUSTA_PWD
+    depends_on:
+      - flibusta-db
+    restart: unless-stopped
+    profiles: ["flibusta-local"]
+
+  flibusta-local:
+    image: docker.io/library/nginx:alpine
+    container_name: nas-flibusta-local
+    ports:
+      - "27100:80"
+    volumes:
+      - ${FLIBUSTA_SRC_DIR:-../flibusta-mirror}/application:/application
+      - ${FLIBUSTA_DATA_DIR:-/mnt/nas/root/FuzzyHD/flibusta-data}/cache:/application/cache
+      - ${FLIBUSTA_ARCHIVES_DIR:-/mnt/nas/root/FuzzyHD/flibusta-data/Flibusta.Net}:/application/flibusta:ro
+      - ./configs/flibusta-nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - flibusta-php
+    restart: unless-stopped
+    profiles: ["flibusta-local"]
+
+  # === DLNA (minidlna, профиль dlna) ===
+  minidlna:
+    image: docker.io/vladgh/minidlna:latest
+    container_name: nas-minidlna
+    network_mode: host
+    environment:
+      - MINIDLNA_MEDIA_DIR_1=A,${MEDIA_MOVIES_HOST_DIR:-/mnt/nas/root/FuzzyHD/Movies}
+      - MINIDLNA_MEDIA_DIR_2=V,${MEDIA_TV_HOST_DIR:-/mnt/nas/root/FuzzyHD/TV}
+      - MINIDLNA_MEDIA_DIR_3=A,${MUSIC_HOST_DIR:-/mnt/nas/root/FuzzyHD/Music}
+      - MINIDLNA_FRIENDLY_NAME=${MINIDLNA_NAME:-NAS-Stack Media}
+      - MINIDLNA_INOTIFY=yes
+    volumes:
+      - ${MEDIA_MOVIES_HOST_DIR:-/mnt/nas/root/FuzzyHD/Movies}:/media/Movies:ro
+      - ${MEDIA_TV_HOST_DIR:-/mnt/nas/root/FuzzyHD/TV}:/media/TV:ro
+      - ${MUSIC_HOST_DIR:-/mnt/nas/root/FuzzyHD/Music}:/media/Music:ro
+    restart: unless-stopped
+    profiles: ["dlna"]
+
+
+volumes:
+  postgres_data:
+  prowlarr-config:
+  prometheus-data:
+  grafana-data:
+  ntfy-cache:
+  flibusta-db-data:
+  scheduler_ssh:
+    name: nas-stack_scheduler_ssh
+  photo-cache:

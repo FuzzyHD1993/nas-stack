@@ -1,0 +1,16 @@
+[Unit]
+Description=NAS notify-service (Redis → notify-send)
+After=network-online.target nas-stack.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/projects/nas-stack/notify-service/notify-service
+Restart=always
+RestartSec=5
+Environment=REDIS_ADDR=localhost:6379
+Environment=NTFY_URL=http://localhost:2586
+Environment=NTFY_TOPIC=nas-alerts
+
+[Install]
+WantedBy=default.target

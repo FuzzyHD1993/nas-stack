@@ -1,0 +1,14 @@
+[Unit]
+Description=NAS Host Agent (sensors, SMART, cleanup)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/nas-host-agent
+ExecStart=%h/projects/nas-host-agent/nas-host-agent
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

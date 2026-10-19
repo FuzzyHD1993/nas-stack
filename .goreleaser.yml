@@ -1,0 +1,77 @@
+# GoReleaser — бинарники хост-демонов.
+# Сейчас в репозитории есть только notify-service; host-agent и books-opener —
+# отдельные проекты. Добавьте их сюда, когда они будут в этом репозитории.
+version: 2
+
+builds:
+  - id: notify
+    dir: ./notify-service
+    main: .
+    binary: nas-notify
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ignore:
+      - goos: windows
+        goarch: arm64
+    flags: [-trimpath]
+    ldflags: [-s -w]
+
+  - id: host-agent
+    dir: ./host-agent
+    main: .
+    binary: nas-host-agent
+    env: [CGO_ENABLED=0]
+    goos: [linux]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags: [-s -w]
+
+  - id: books-opener
+    dir: ./books-opener
+    main: .
+    binary: nas-books-opener
+    env: [CGO_ENABLED=0]
+    goos: [linux]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags: [-s -w]
+
+archives:
+  - id: notify-archive
+    ids: [notify]
+    formats: ['tar.gz']
+    name_template: "nas-notify_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats: ['zip']
+    files: [LICENSE, README.md]
+
+  - id: host-agent-archive
+    ids: [host-agent]
+    formats: ['tar.gz']
+    name_template: "nas-host-agent_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files: [LICENSE, README.md, host-agent/systemd/*]
+
+  - id: books-opener-archive
+    ids: [books-opener]
+    formats: ['tar.gz']
+    name_template: "nas-books-opener_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files: [LICENSE, README.md]
+
+checksum:
+  name_template: 'checksums.txt'
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude: ['^docs:', '^test:', '^chore:']
+
+release:
+  mode: keep-existing
+  draft: false
+  prerelease: auto

@@ -1,0 +1,978 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NAS Dashboard</title>
+    <meta name="theme-color" content="#cba6f7">
+    <link rel="manifest" href="/manifest.json">
+    <meta name="nas-auth-enabled" content="__NAS_AUTH_ENABLED__">
+    <meta name="nas-books-opener-url" content="http://localhost:9999">
+    <meta name="nas-youtube-host-dir" content="/mnt/nas/YT_video">
+    <script src="/static/theme.js"></script>
+    <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+    <div id="update-banner" style="display:none; background:var(--accent); color:var(--bg); padding:8px 16px; text-align:center; position:fixed; top:0; left:0; right:0; z-index:2000;">
+        🔄 Доступно обновление: <span id="update-count">0</span> коммитов.
+        <button onclick="runUpdate()" style="margin-left:12px; background:var(--bg); color:var(--accent); border:none; padding:4px 12px; border-radius:4px; cursor:pointer;">Обновить</button>
+        <button onclick="dismissUpdate()" style="margin-left:8px; background:transparent; color:var(--bg); border:none; cursor:pointer;">✕</button>
+    </div>
+    <div id="top-progress" class="top-progress"></div>
+
+    <div id="login-screen" class="login-screen" style="display:none;">
+        <div class="login-card">
+            <h1 class="login-title">🖥️ NAS Dashboard</h1>
+            <p class="login-subtitle">Введите пароль для входа</p>
+            <form onsubmit="event.preventDefault(); doLogin();">
+                <input type="password" id="login-password" class="login-input" placeholder="Пароль" autofocus>
+                <div id="login-error" class="login-error"></div>
+                <button type="submit" class="login-button">🔓 Войти</button>
+            </form>
+        </div>
+    </div>
+
+    <header class="app-header">
+        <div class="header-left">
+            <h1 class="app-logo">🖥️ NAS Dashboard</h1>
+            <div id="health-indicator" title="Статус сервисов" onclick="showTab('health')" style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-left:14px;">
+                <div id="health-dot" style="width:10px;height:10px;border-radius:50%;background:gray;"></div>
+                <span id="health-text" style="font-size:12px;color:var(--fg-muted);">Проверка...</span>
+            </div>
+        </div>
+        <div class="header-right">
+            <div id="mini-player" class="mini-player" onclick="openFullPlayer()" title="Открыть плеер">
+                <img id="mini-cover" class="mini-cover" src="" onclick="event.stopPropagation(); openCurrentAlbum()" title="Открыть альбом" onerror="this.style.display='none'">
+                <div class="mini-info" onclick="event.stopPropagation(); scrollToCurrentTrack()" title="К текущему треку">
+                    <span class="mini-title" id="mini-title">—</span>
+                    <span class="mini-artist" id="mini-artist" onclick="event.stopPropagation(); openCurrentArtist()" title="К артисту">—</span>
+                </div>
+                <button onclick="event.stopPropagation(); musicPrev()" class="mini-btn" title="Prev">⏮</button>
+                <button onclick="event.stopPropagation(); musicPlayPause()" class="mini-btn" title="Play/Pause">⏯</button>
+                <button onclick="event.stopPropagation(); musicNext()" class="mini-btn" title="Next">⏭</button>
+                <input type="range" id="mini-volume-range" class="mini-vol-range" min="0" max="100" oninput="musicVolume(this.value)" onclick="event.stopPropagation()" title="Громкость">
+                <button onclick="event.stopPropagation(); openFullPlayer()" class="mini-btn" title="Развернуть">⛶</button>
+                <div class="mini-progress" id="mini-progress"><div class="mini-progress-fill" id="mini-progress-fill"></div></div>
+            </div>
+            <button class="header-btn" onclick="openGlobalSearch()" title="Поиск (Ctrl+K)">🔍</button>
+            <div style="position:relative;">
+                <button class="header-btn" id="notifications-btn" onclick="toggleNotifPanel()" title="Уведомления">🔔</button>
+                <span id="notif-count" style="position:absolute; top:2px; right:2px; background:var(--error); color:var(--bg); border-radius:50%; font-size:10px; min-width:16px; height:16px; display:none; align-items:center; justify-content:center; padding:0 4px;">0</span>
+            </div>
+            <button class="header-btn" onclick="openSettings()" title="Настройки">⚙️</button>
+        </div>
+    </header>
+    <div id="notif-panel" style="display:none; position:fixed; top:74px; right:20px; width:340px; max-height:70vh; overflow-y:auto; background:var(--surface-strong); border:1px solid var(--glass-border); border-radius:12px; box-shadow:0 8px 24px var(--shadow-color); z-index:2000; padding:12px;"></div>
+    <div id="search-modal" class="modal" onclick="if(event.target===this)closeGlobalSearch()">
+        <div class="settings-panel" style="max-width:720px; max-height:80vh; overflow-y:auto;">
+            <h3>🔍 Глобальный поиск</h3>
+            <input type="text" id="global-search-input" placeholder="Искать фильмы, сериалы, книги, торренты..." style="width:100%; margin-bottom:12px;" onkeydown="if(event.key==='Enter')runGlobalSearch()" />
+            <div id="global-search-results"></div>
+        </div>
+    </div>
+    <div id="command-palette" class="modal" onclick="if(event.target===this)closeCommandPalette()">
+        <div class="cmd-palette-content">
+            <input type="text" id="cmd-input" placeholder="🔍 Введите команду..." autocomplete="off"
+                   oninput="renderCommands(this.value)"
+                   onkeydown="cmdKeydown(event)">
+            <div id="cmd-list"></div>
+        </div>
+    </div>
+    <button id="scroll-top" class="scroll-top" onclick="window.scrollTo({top:0,behavior:'smooth'})" title="Наверх">↑</button>
+    <div id="album-modal" class="modal" onclick="if(event.target===this)closeAlbumModal()">
+        <div class="album-modal-content">
+            <div class="album-header">
+                <img id="album-cover" src="" onerror="this.style.display='none'">
+                <div class="album-info">
+                    <h2 id="album-title">—</h2>
+                    <div id="album-artist" class="album-artist">—</div>
+                    <button onclick="playCurrentAlbum()" class="album-play-all">▶️ Играть всё</button>
+                    <button onclick="playArtistOnly()" class="album-play-all" style="background:var(--bg-button);color:var(--fg);margin-left:6px;">🎤 Только артист</button>
+                    <button onclick="searchAlbumOnRuTracker()" class="album-play-all" style="background:var(--bg-button);color:var(--fg);margin-left:6px;">🔍 RuTracker</button>
+                </div>
+            </div>
+            <div id="album-tracks" class="album-tracks"></div>
+            <button onclick="closeAlbumModal()" class="album-close">✖ Закрыть</button>
+        </div>
+    </div>
+
+    <div id="smart-search-modal" class="modal" onclick="if(event.target===this)this.classList.remove('show')">
+        <div class="album-modal-content">
+            <h2>✨ Умный поиск фильмов</h2>
+            <div style="display:flex;gap:8px;margin:12px 0;">
+                <input id="smart-search-input" placeholder="напр. «лёгкая комедия 90 минут»" style="flex:1;"
+                       onkeydown="if(event.key==='Enter')runSmartSearch()">
+                <button onclick="runSmartSearch()">Найти</button>
+            </div>
+            <div id="smart-search-params" style="font-size:12px;color:var(--fg-muted);"></div>
+            <div id="smart-search-results" style="margin-top:10px;"></div>
+            <button onclick="document.getElementById('smart-search-modal').classList.remove('show')" class="album-close">✖ Закрыть</button>
+        </div>
+    </div>
+
+    <div id="duplicates-modal" class="modal" onclick="if(event.target===this)this.classList.remove('show')">
+        <div class="album-modal-content">
+            <h2>🔁 Дубликаты в библиотеке</h2>
+            <div id="duplicates-list" style="margin-top:10px;"><div class="loading">Загрузка...</div></div>
+            <button onclick="document.getElementById('duplicates-modal').classList.remove('show')" class="album-close">✖ Закрыть</button>
+        </div>
+    </div>
+
+    <div id="lyrics-modal" class="modal" onclick="if(event.target===this)closeLyrics()">
+        <div class="lyrics-content">
+            <div class="lyrics-header">
+                <h3 id="lyrics-title">—</h3>
+                <button onclick="closeLyrics()">✖</button>
+            </div>
+            <div id="lyrics-body" class="lyrics-body">Загрузка...</div>
+        </div>
+    </div>
+    <div id="similar-modal" class="modal" onclick="if(event.target===this)closeSimilar()">
+        <div class="lyrics-content">
+            <div class="lyrics-header">
+                <h3>🎯 Похожие треки</h3>
+                <button onclick="closeSimilar()">✖</button>
+            </div>
+            <div id="similar-body" class="lyrics-body"></div>
+        </div>
+    </div>
+
+    <div id="add-to-playlist-modal" class="modal" onclick="if(event.target===this)closeAddToPlaylist()">
+        <div class="lyrics-content">
+            <div class="lyrics-header">
+                <h3>➕ Добавить в плейлист</h3>
+                <button onclick="closeAddToPlaylist()">✖</button>
+            </div>
+            <div class="lyrics-body">
+                <div id="add-pl-current-track" style="color:var(--fg-dim);font-size:12px;margin-bottom:12px;"></div>
+                <div style="display:flex;gap:8px;margin-bottom:16px;">
+                    <input id="new-playlist-name" placeholder="Новый плейлист..." style="flex:1;">
+                    <button onclick="createPlaylistAndAdd()">Создать</button>
+                </div>
+                <div id="playlists-list"></div>
+                <button onclick="closeAddToPlaylist()" style="margin-top:16px;">Отмена</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="reader-modal" class="modal" onclick="if(event.target===this)closeReader()">
+        <div class="reader-content">
+            <div class="reader-header">
+                <h3 id="reader-title">—</h3>
+                <div class="reader-controls">
+                    <button onclick="readerPrev()" title="Назад">‹</button>
+                    <span id="reader-page">—</span>
+                    <button onclick="readerNext()" title="Вперёд">›</button>
+                    <button onclick="readerChangeFont(-1)" title="Меньше шрифт">A-</button>
+                    <button onclick="readerChangeFont(1)" title="Больше шрифт">A+</button>
+                    <button onclick="toggleReaderTheme()" id="reader-theme-btn" title="Тема чтения">🌙</button>
+                    <button onclick="closeReader()" title="Закрыть">✖</button>
+                </div>
+            </div>
+            <div id="reader-view" class="reader-view"></div>
+            <div id="foliate-view" class="reader-view" style="display:none;"></div>
+        </div>
+    </div>
+    <div id="playlist-modal" class="modal" onclick="if(event.target===this)closePlaylistModal()">
+        <div class="settings-panel" style="max-width:420px;">
+            <h3>📋 Новый плейлист</h3>
+            <input type="text" id="playlist-name-input" placeholder="Название плейлиста" style="width:100%;margin-bottom:12px;">
+            <p style="color:var(--fg-muted);font-size:12px;margin-bottom:12px;">Плейлист сохранит текущую очередь воспроизведения (MPD).</p>
+            <div style="display:flex;gap:8px;justify-content:flex-end;">
+                <button onclick="closePlaylistModal()">Отмена</button>
+                <button onclick="createPlaylist()" style="background:var(--accent);color:var(--bg);">💾 Сохранить</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="tabs" id="tabs-nav"></div>
+
+    <!-- МЕТРИКИ -->
+    <div id="tab-stats" class="tab-content">
+        <h2>📊 Метрики</h2>
+        <div id="stats" class="card">Загрузка...</div>
+
+        <h2>⚙️ CPU по ядрам</h2>
+        <div id="cpu-cores" class="card">Загрузка...</div>
+
+        <h2>📈 Load / Uptime</h2>
+        <div id="load-info" class="card">Загрузка...</div>
+
+        <h2>🌐 Сеть</h2>
+        <div id="network-info" class="card">Загрузка...</div>
+
+        <h2>🔝 Топ процессов</h2>
+        <div id="processes-info" class="card">Загрузка...</div>
+
+        <h2>🌡️ Температуры</h2>
+        <div id="sensors-info" class="card"><div style="color:var(--fg-dim);">Загрузка...</div></div>
+
+        <h2>💾 SMART дисков</h2>
+        <div id="smart-info" class="card"><div style="color:var(--fg-dim);">Загрузка...</div></div>
+
+        <h2>💾 NAS-папки</h2>
+        <div id="nas-info" class="card">Загрузка...</div>
+
+        <h2>🚀 Сервисы</h2>
+        <div id="status" class="card">Загрузка...</div>
+    </div>
+
+    <!-- ТОРРЕНТЫ -->
+    <div id="tab-torrents" class="tab-content">
+        <div class="torrent-stats-card" id="torrent-stats-card">
+            <div class="ts-row">
+                <span class="ts-stat">⬇️ <b id="ts-active">0</b> активных</span>
+                <span class="ts-stat">🌱 <b id="ts-seeding">0</b> раздаётся</span>
+                <span class="ts-stat">✅ <b id="ts-finished">0</b> завершено</span>
+                <span class="ts-stat">❌ <b id="ts-error">0</b> ошибок</span>
+            </div>
+            <div class="ts-row">
+                <span class="ts-stat">📥 <b id="ts-downloaded">0</b> GB</span>
+                <span class="ts-stat">📤 <b id="ts-uploaded">0</b> GB</span>
+                <span class="ts-stat">Ratio: <b id="ts-ratio">0.00</b></span>
+            </div>
+        </div>
+        <div class="rutracker-card">
+            <div class="rutracker-header">
+                <span class="rutracker-logo">🎵 RuTracker</span>
+                <span id="rutracker-username" class="rutracker-username">—</span>
+                <button onclick="refreshRutracker()" class="rutracker-refresh">🔄</button>
+            </div>
+            <div class="rutracker-stats" id="rutracker-stats">
+                <span class="rutracker-loading">Загрузка...</span>
+            </div>
+        </div>
+        <h2>🔍 Поиск торрентов (Prowlarr)</h2>
+        <div class="card">
+            <div class="books-search">
+                <input type="text" id="torrent-query" placeholder="Название релиза..." onkeydown="if(event.key==='Enter')searchTorrentsUI()" />
+                <button onclick="searchTorrentsUI()">🔍 Найти</button>
+            </div>
+            <div class="books-controls" style="margin-bottom:0;">
+                <label>Индексатор:
+                    <select id="indexer-filter">
+                        <option value="">Все</option>
+                    </select>
+                </label>
+                <label>Категория:
+                    <select id="torrent-category">
+                        <option value="">Все категории</option>
+                        <option value="3000">🎵 Музыка</option>
+                        <option value="2000">🎬 Фильмы</option>
+                        <option value="5000">📺 Сериалы</option>
+                        <option value="7000">📚 Книги</option>
+                        <option value="4000">🎮 Игры</option>
+                        <option value="1000">🕹️ Консоли</option>
+                    </select>
+                </label>
+                <label>Сортировка:
+                    <select id="search-sort" onchange="renderSearchResultsPage()">
+                        <option value="seeders">По сидам</option>
+                        <option value="size">По размеру</option>
+                        <option value="date">По дате</option>
+                    </select>
+                </label>
+            </div>
+            <div id="search-results-block" style="margin-top:10px;">
+                <div class="search-header">
+                    <span class="search-count" id="search-count">Найдено: 0</span>
+                    <label style="display: flex; align-items: center; gap: 6px; color: var(--fg-muted); font-size: 12px;">
+                        📁 Папка:
+                        <select id="dest-select" style="background: var(--bg-button); color: var(--fg); border: 1px solid var(--bg-button-hover); border-radius: 4px; padding: 4px 8px; font-size: 12px;">
+                        </select>
+                    </label>
+                    <button id="toggle-search-btn" onclick="toggleSearchResults()">▾ Свернуть</button>
+                </div>
+                <div id="search-results-content">
+                    <div id="search-results"></div>
+                </div>
+            </div>
+        </div>
+
+        <h2>📥 Добавить торрент</h2>
+        <div class="card">
+            <input type="text" id="magnet" placeholder="magnet:?xt=urn:btih:..." style="width:70%;" />
+            <button onclick="addTorrent()">Добавить</button>
+            <div id="log" style="margin-top:10px; font-size:12px; color:var(--fg-muted);"></div>
+        </div>
+
+        <h2>📊 Статистика</h2>
+        <div id="torrent-stats" class="card">Загрузка...</div>
+
+        <h2>⚙️ Download Station</h2>
+        <div class="ds-settings-card">
+            <div class="ds-row">
+                <label>Одновременных загрузок:</label>
+                <select id="ds-max-download" onchange="saveDsSettings()">
+                    <option value="0">∞ (без лимита)</option>
+                    <option value="1">1</option>
+                    <option value="2">2</option>
+                    <option value="3">3</option>
+                    <option value="4">4</option>
+                    <option value="5">5</option>
+                    <option value="6">6</option>
+                    <option value="7">7</option>
+                    <option value="8">8</option>
+                    <option value="9">9</option>
+                    <option value="10">10</option>
+                </select>
+                <span id="ds-status" style="color:var(--success); font-size:12px;"></span>
+            </div>
+            <div class="ds-hint">Лимит одновременных загрузок на NAS (Download Station → Очередь).</div>
+        </div>
+
+        <h2>📋 Торренты <span id="torrent-count" style="color:var(--fg-dim); font-size:14px;"></span></h2>
+        <div class="torrent-filters">
+            <input type="text" id="torrent-filter-search" placeholder="🔍 Поиск..." oninput="renderTorrentsPage()">
+            <select id="torrent-filter-status" onchange="renderTorrentsPage()">
+                <option value="">Все статусы</option>
+                <option value="downloading">⬇️ Скачивается</option>
+                <option value="seeding">🌱 Раздаётся</option>
+                <option value="paused">⏸ Пауза</option>
+                <option value="finished">✅ Завершено</option>
+                <option value="error">❌ Ошибка</option>
+            </select>
+            <select id="torrent-sort" onchange="renderTorrentsPage()">
+                <option value="date">📅 Дата</option>
+                <option value="name">🔤 Название</option>
+                <option value="size">💾 Размер</option>
+                <option value="speed">⚡ Скорость</option>
+                <option value="progress">📊 Прогресс</option>
+            </select>
+        </div>
+        <div id="torrents" class="torrents">Загрузка...</div>
+    </div>
+
+    <!-- КНИГИ -->
+    <div id="tab-books" class="tab-content">
+        <h2>📚 Поиск книг (Флибуста)</h2>
+
+        <div class="books-search">
+            <input type="text" id="book-query" placeholder="Название или автор..." onkeydown="if(event.key==='Enter')searchBooks()" />
+            <button onclick="searchBooks()">🔍 Найти</button>
+        </div>
+
+        <div class="books-controls">
+            <span id="books-count" style="color:var(--fg-muted);">Найдено: 0 книг</span>
+            <span style="flex:1;"></span>
+            <label>Сортировка:
+                <select id="books-sort" onchange="renderBooks()">
+                    <option value="title">По названию</option>
+                    <option value="author">По автору</option>
+                    <option value="year">По году</option>
+                </select>
+            </label>
+            <label>Фильтр:
+                <select id="books-filter" onchange="renderBooks()">
+                    <option value="all">Все</option>
+                    <option value="fb2">Только FB2</option>
+                    <option value="epub">Только EPUB</option>
+                    <option value="mobi">Только MOBI</option>
+                </select>
+            </label>
+        </div>
+
+        <div id="books-grid" class="books-grid">
+            <div class="loading">Введи запрос и нажми «Найти»</div>
+        </div>
+
+        <h2>📥 Скачанные <span id="downloaded-count" style="color:var(--fg-dim); font-size:14px;"></span>
+            <button onclick="openFolder()" style="float:right;font-size:12px;padding:4px 10px;">📁 Открыть папку</button>
+        </h2>
+        <div id="downloaded" class="card">Загрузка...</div>
+    </div>
+
+    <!-- ИСТОРИЯ -->
+    <div id="tab-history" class="tab-content">
+        <h2>📜 История событий</h2>
+        <div id="download-stats" class="card" style="margin-bottom:16px;"></div>
+        <div id="history" class="history-list">Загрузка...</div>
+    </div>
+
+    <!-- SETTINGS -->
+    <div id="tab-settings" class="tab-content">
+        <h2>⚙️ Настройки</h2>
+        <div class="settings-section">
+            <h3>🎨 Внешний вид</h3>
+            <div class="setting-row">
+                <label>Тема:</label>
+                <select id="set-theme" onchange="changeTheme(this.value)">
+                    <option value="auto">🌗 Авто</option>
+                    <option value="mocha">🌙 Catppuccin Mocha</option>
+                    <option value="latte">☀️ Catppuccin Latte</option>
+                    <option value="dracula">🧛 Dracula</option>
+                    <option value="nord">❄️ Nord</option>
+                    <option value="tokyo-night">🌃 Tokyo Night</option>
+                    <option value="rose-pine">🌹 Rosé Pine</option>
+                    <option value="everforest">🌲 Everforest</option>
+                    <option value="kanagawa">🌊 Kanagawa</option>
+                    <option value="gruvbox">🟫 Gruvbox</option>
+                    <option value="one-dark">⚫ One Dark</option>
+                </select>
+            </div>
+            <div id="theme-preview-row" class="theme-preview-row"></div>
+            <div class="setting-row">
+                <label>Акцент (hue):</label>
+                <input type="range" id="accent-hue" min="0" max="360" value="210"
+                       oninput="applyAccentHue(this.value, true)" style="flex:1;">
+                <button onclick="resetAccentHue()" title="Сбросить">↺</button>
+            </div>
+        </div>
+        <div class="settings-section">
+            <h3>🎬 Медиа</h3>
+            <div class="setting-row">
+                <label><input type="checkbox" id="set-autonext" onchange="toggleAutoNext(this.checked)"> Авто-следующая серия</label>
+            </div>
+        </div>
+        <div class="settings-section">
+            <h3>📑 Расположение вкладок</h3>
+            <p style="color:var(--fg-muted); font-size:12px; margin-bottom:12px;">Перетаскивай за ☰ для изменения порядка. Чекбокс — показать/скрыть.</p>
+            <div id="tabs-settings" class="tabs-settings"></div>
+            <div class="setting-row" style="margin-top:12px;">
+                <button onclick="resetTabOrder()">🔄 Сбросить порядок</button>
+            </div>
+        </div>
+        <div class="settings-section">
+            <h3>🔔 Подписки на сериалы</h3>
+            <div id="subscriptions-list" style="display:flex;flex-direction:column;gap:6px;"></div>
+        </div>
+        <div class="settings-section">
+            <h3>💾 Бэкапы</h3>
+            <div class="setting-row" style="margin-bottom:10px;">
+                <button onclick="runBackup()">▶️ Создать бэкап сейчас</button>
+                <button onclick="loadBackups()">🔄 Обновить список</button>
+            </div>
+            <div id="backup-list"></div>
+        </div>
+        <div class="settings-section">
+            <h3>🧹 Очистка диска</h3>
+            <div class="setting-row" style="margin-bottom:10px;">
+                <button onclick="previewCleanup()">🔍 Показать, что можно очистить</button>
+                <button onclick="runCleanup()" id="cleanup-btn" style="display:none;">🧹 Очистить</button>
+            </div>
+            <div id="cleanup-preview"></div>
+        </div>
+        <div class="settings-section">
+            <h3>🔐 Переменные .env</h3>
+            <div id="env-list"><div class="loading">Загрузка...</div></div>
+            <div class="setting-row" style="margin-top:10px;">
+                <button onclick="loadEnv()">🔄 Обновить</button>
+            </div>
+        </div>
+        <div class="settings-section">
+            <h3>🔄 Обновление стека</h3>
+            <div class="setting-row">
+                <button onclick="runUpdate()">🔄 Обновить сейчас</button>
+                <button onclick="rollbackUpdate()" class="danger">↩️ Откатить</button>
+            </div>
+            <div id="update-status" style="font-size:12px;color:var(--fg-muted);margin-top:8px;"></div>
+        </div>
+        <div class="settings-section" style="border:1px solid var(--error);">
+            <h3 style="color:var(--error);">⚠️ Опасная зона</h3>
+            <p style="font-size:13px;color:var(--fg-muted);margin-bottom:10px;">Сбросить все настройки (.env) и вернуться к мастеру настройки?</p>
+            <button onclick="resetSetup()" style="background:var(--error);color:var(--bg);">🗑 Сбросить настройки</button>
+        </div>
+        <div class="settings-section">
+            <h3>📺 DLNA (телевизоры)</h3>
+            <p style="font-size:13px;color:var(--fg-muted);">Включите профиль DLNA, чтобы телевизор видел медиатеку в сети:</p>
+            <pre style="background:var(--bg);padding:10px;border-radius:6px;font-size:12px;overflow-x:auto;">podman compose --profile dlna up -d</pre>
+            <p style="font-size:12px;color:var(--fg-dim);">Источник: minidlna, имя «NAS-Stack Media» (переменная MINIDLNA_NAME).</p>
+        </div>
+        <div class="settings-section">
+            <h3>🔧 Дополнительно</h3>
+            <div class="setting-row">
+                <button onclick="exportSettings()">📥 Экспорт настроек</button>
+                <button onclick="importSettings()">📤 Импорт</button>
+                <button onclick="openSmartSearch()">✨ Умный поиск</button>
+                <button onclick="openDuplicates()">🔁 Дубликаты</button>
+                <button onclick="resetSettings()" class="danger">🗑️ Сбросить</button>
+                <button onclick="doLogout()" class="danger">🔓 Выйти</button>
+            </div>
+        </div>
+        <div class="settings-section">
+            <h3>🗺️ Дорожная карта</h3>
+            <div id="roadmap"></div>
+        </div>
+    </div>
+
+    <!-- MUSIC -->
+    <div id="tab-today" class="tab-content active">
+        <h2>🏠 Сегодня</h2>
+        <div class="dashboard-grid" id="today-grid">
+            <div class="card" id="today-torrents"><h3>📥 Торренты</h3><div class="loading">Загрузка...</div></div>
+            <div class="card" id="today-music"><h3>🎵 Музыка</h3><div class="loading">Загрузка...</div></div>
+            <div class="card" id="today-nas"><h3>💾 NAS</h3><div class="loading">Загрузка...</div></div>
+            <div class="card" id="today-youtube"><h3>📹 YouTube</h3><div class="loading">Загрузка...</div></div>
+            <div class="card" id="today-health"><h3>🩺 Сервисы</h3><div class="loading">Загрузка...</div></div>
+        </div>
+    </div>
+
+    <div id="tab-music" class="tab-content">
+        <h2>🎵 Музыка</h2>
+        <div id="music-layout">
+            <div id="music-sidebar">
+                <input type="text" id="music-search" placeholder="🔍 Поиск артиста, альбома, трека..." oninput="filterMusicSidebar(this.value)">
+                <div class="music-filter">
+                    <button class="active" onclick="setMusicSidebarTab('artists', this)">👤 Артисты</button>
+                    <button onclick="setMusicSidebarTab('albums', this)">💿 Альбомы</button>
+                    <button onclick="setMusicSidebarTab('playlists', this)">📋 Плейлисты</button>
+                </div>
+                <div id="music-sidebar-list"><div class="loading">Загрузка...</div></div>
+            </div>
+            <div id="music-main">
+                <div id="music-detail" style="display:none;"></div>
+                <div id="music-main-default">
+        <div class="music-visualizer" id="music-visualizer">
+            <div class="viz-bar"></div><div class="viz-bar"></div><div class="viz-bar"></div><div class="viz-bar"></div>
+            <div class="viz-bar"></div><div class="viz-bar"></div><div class="viz-bar"></div><div class="viz-bar"></div>
+            <div class="viz-bar"></div><div class="viz-bar"></div><div class="viz-bar"></div><div class="viz-bar"></div>
+            <div class="viz-bar"></div><div class="viz-bar"></div><div class="viz-bar"></div><div class="viz-bar"></div>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;font-size:13px;">
+            <label style="display:flex;align-items:center;gap:8px;color:var(--fg);cursor:pointer;">
+                <input type="checkbox" id="bit-perfect-toggle">
+                🎛 Показывать bit-perfect индикатор
+            </label>
+            <span class="hint" style="color:var(--fg-dim);font-size:12px;">ℹ️ Если используете EasyEffects/EQ — выключите: PipeWire ресемплит, индикатор всегда false.</span>
+        </div>
+        <div class="music-tabs" style="display:flex; gap:8px; margin-bottom:12px;">
+            <button class="music-tab active" onclick="musicTab('albums', this)">🎵 Альбомы</button>
+            <button class="music-tab" onclick="musicTab('playlists', this)">📋 Плейлисты</button>
+            <button class="music-tab" onclick="musicTab('queue', this)">📜 Очередь</button>
+            <button class="music-tab" onclick="musicTab('stats', this)">📊 Статистика</button>
+            <button class="music-tab" onclick="musicTab('smart', this)">✨ Умные</button>
+            <button class="music-tab" onclick="musicTab('favorites', this)">❤️ Избранное</button>
+            <button class="music-tab" onclick="musicTab('recent', this)">🕐 Недавно</button>
+        </div>
+        <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:10px;">
+            <span id="rating-stars" style="font-size:20px;">★★★☆☆</span>
+            <label style="color:var(--fg-muted);font-size:12px;">😴 Таймер:
+                <select onchange="setSleepTimer(parseInt(this.value))" style="background:var(--bg-button);color:var(--fg);border-radius:6px;padding:4px 8px;">
+                    <option value="0">выкл</option>
+                    <option value="15">15 мин</option>
+                    <option value="30">30 мин</option>
+                    <option value="60">60 мин</option>
+                </select>
+            </label>
+        </div>
+        <div id="music-content-albums">
+            <div class="music-search" style="margin:15px 0; display:flex; gap:8px;">
+                <input type="text" id="music-search-input" placeholder="🔍 Поиск в музыке..." style="flex:1;" onkeydown="if(event.key==='Enter')musicSearch()">
+                <button onclick="findMusicInTrackers()" class="music-find-btn">🔍 Найти в трекерах</button>
+                <select id="music-sort" onchange="musicLoadAlbums()" style="background:var(--bg-button); color:var(--fg); border:1px solid var(--bg-button-hover); border-radius:4px; padding:6px 10px; font-size:13px;">
+                    <option value="artist">🎤 По артисту</option>
+                    <option value="album">💿 По альбому</option>
+                    <option value="recent">🆕 Недавние</option>
+                </select>
+            </div>
+            <h3>Альбомы <span id="music-albums-count" style="color:var(--fg-dim); font-size:13px;"></span></h3>
+            <div id="music-albums" class="music-albums-grid"><div class="loading">Загрузка...</div></div>
+            <div id="browser-audio-panel" style="display:none; margin-top:16px; padding:12px; background:var(--bg-card); border-radius:10px;">
+                <div style="font-size:13px;color:var(--fg-muted);margin-bottom:8px;">🌐 Браузерный режим (MPD не найден) — HTML5 + ffmpeg</div>
+                <div id="browser-title" style="font-size:15px;font-weight:600;">—</div>
+                <div id="browser-artist" style="font-size:12px;color:var(--fg-dim);margin-bottom:8px;">—</div>
+                <audio id="browser-audio" controls preload="none" style="width:100%;"></audio>
+                <div id="browser-now" style="font-size:12px;color:var(--fg-dim);margin-top:6px;"></div>
+                <div id="browser-tracks" class="album-tracks" style="margin-top:8px;"></div>
+            </div>
+        </div>
+        <div id="music-content-playlists" style="display:none;">
+            <h3>Плейлисты <button onclick="openPlaylistModal()" style="margin-left:8px;">➕ Создать</button></h3>
+            <div id="music-playlists" class="music-albums-grid"><div class="loading">Загрузка...</div></div>
+            <div id="playlist-tracks"></div>
+        </div>
+        <div id="music-content-queue" style="display:none;">
+            <h3>Очередь <button onclick="musicQueueClear()" style="margin-left:8px;">🗑️ Очистить</button></h3>
+            <div id="music-queue" class="album-tracks"></div>
+        </div>
+        <div id="music-content-stats" style="display:none;">
+            <h3>📊 Статистика прослушивания</h3>
+            <div id="music-stats"></div>
+            <div id="music-stats-pg"></div>
+        </div>
+        <div id="music-content-smart" style="display:none;">
+            <h3>✨ Умные плейлисты</h3>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+                <button onclick="loadSmartPlaylist('recent')">🕐 Недавно</button>
+                <button onclick="loadSmartPlaylist('top_month')">🏆 Топ месяца</button>
+                <button onclick="loadSmartPlaylist('top_year')">🏆 Топ года</button>
+                <button onclick="loadSmartPlaylist('forgotten')">💤 Забытые</button>
+                <button onclick="loadSmartPlaylist('wave')">🌊 Моя волна</button>
+            </div>
+            <div id="smart-playlist"></div>
+        </div>
+        <div id="music-content-favorites" style="display:none;">
+            <h3>❤️ Избранное</h3>
+            <div id="music-favorites"></div>
+        </div>
+        <div id="music-content-recent" style="display:none;">
+            <h3>🕐 Слушали недавно</h3>
+            <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;">
+                <span style="color:var(--fg-dim);font-size:12px;">Всего записей: <span id="listens-count">—</span></span>
+                <button onclick="clearListens()" style="background:var(--error);color:var(--bg);">🗑 Очистить историю</button>
+            </div>
+            <div id="music-recent"></div>
+        </div>
+                </div>
+            </div>
+            <div id="music-player-bar">
+        <div class="music-player">
+            <div class="music-now-playing">
+                <img id="music-cover" src="" onclick="openCurrentAlbum()" title="Открыть альбом" style="cursor:pointer;" onerror="this.style.display='none'">
+                <div class="music-info">
+                    <div id="music-title" onclick="scrollToCurrentTrack()" title="К текущему треку" style="cursor:pointer;">—</div>
+                    <div id="music-artist" onclick="openCurrentArtist()" title="К артисту" style="cursor:pointer;">—</div>
+                    <div id="music-album">—</div>
+                    <div id="music-audio-info" class="music-audio-info"></div>
+                    <span id="audio-badge" class="audio-badge"></span>
+                </div>
+            </div>
+            <div class="music-controls">
+                <button onclick="musicPrev()">⏮</button>
+                <button onclick="musicPlayPause()" id="music-play-btn">▶️</button>
+                <button onclick="musicNext()">⏭</button>
+                <button onclick="musicRadioNext()" title="Моя волна" id="music-radio-btn">📻</button>
+                <button onclick="musicShowLyrics()" title="Текст песни" id="lyrics-btn">📝</button>
+                <button onclick="toggleFavorite()" title="Избранное" id="fav-btn">🤍</button>
+                <button onclick="musicShowSimilar()" title="Похожие" id="similar-btn">🎯</button>
+                <button onclick="musicShuffle()" id="music-shuffle-btn">🔀</button>
+                <button onclick="musicRepeat()" id="music-repeat-btn">🔁</button>
+                <button onclick="openFullPlayer()" title="Развернуть плеер">⛶</button>
+                <input type="range" id="music-volume" min="0" max="100" oninput="musicVolume(this.value)">
+            </div>
+        </div>
+        <div class="music-progress" id="music-progress-container">
+            <span id="music-elapsed">0:00</span>
+            <div class="music-seek-bar" id="music-seek-bar">
+                <div class="music-seek-fill" id="music-seek-fill"></div>
+                <div class="music-seek-handle" id="music-seek-handle"></div>
+            </div>
+            <span id="music-duration">0:00</span>
+        </div>
+
+            </div>
+        </div>
+    </div>
+    <!-- YOUTUBE -->
+    <div id="tab-youtube" class="tab-content">
+        <h2>📹 Скачать видео с YouTube</h2>
+
+        <div class="card">
+            <input type="text" id="yt-url" placeholder="https://www.youtube.com/watch?v=..." style="width:70%;" />
+            <select id="yt-format">
+                <option value="mp4">MP4 (видео)</option>
+                <option value="mp3">MP3 (аудио)</option>
+            </select>
+            <select id="yt-quality">
+                <option value="1080">1080p</option>
+                <option value="720">720p</option>
+                <option value="480">480p</option>
+                <option value="best">Лучшее</option>
+            </select>
+            <button onclick="addYoutubeJob()">⬇️ Скачать</button>
+            <div id="yt-log" style="margin-top:10px; font-size:12px; color:var(--fg-muted);"></div>
+        </div>
+
+        <h2>📋 Задачи <span id="yt-count" style="color:var(--fg-dim); font-size:14px;"></span></h2>
+        <div id="yt-jobs" class="torrents">Загрузка...</div>
+    </div>
+
+    <!-- МЕДИА -->
+    <div id="tab-media" class="tab-content">
+        <h2>🎬 Медиатека</h2>
+        <div class="media-controls">
+            <button onclick="scanMedia(event)">🔄 Обновить библиотеку</button>
+            <button onclick="rollRandomMovie()" id="roll-random-btn" style="background:var(--purple);color:var(--bg);margin-left:8px;">🎲 Случайный фильм</button>
+            <button onclick="openRenameModal()" style="background:var(--bg-button);color:var(--fg);margin-left:8px;">🔧 Переименование</button>
+            <span id="media-stats" style="color: var(--fg-muted); margin-left: 10px;"></span>
+            <span id="watchdog-status" title="watchdog: авто-обнаружение новых файлов (fsnotify + polling)" style="color:var(--fg-dim); font-size:11px; margin-left:auto;">👀 watchdog</span>
+        </div>
+        <div class="shelf" id="continue-shelf">
+            <div id="continue-watching" class="continue-row"></div>
+        </div>
+        <div id="library-stats" style="display:flex; flex-wrap:wrap; gap:10px; margin-bottom:15px;"></div>
+        <div id="smart-shelves" class="smart-shelves"></div>
+        <div class="media-tabs">
+            <button class="media-tab active" onclick="showMediaType('movie', event)">🎬 Фильмы</button>
+            <button class="media-tab" onclick="showMediaType('tv', event)">📺 Сериалы</button>
+            <button class="media-tab" onclick="showMediaPlaylists(event)">📋 Плейлисты</button>
+        </div>
+        <div class="media-filters" style="display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:15px;">
+            <input type="text" id="media-search" placeholder="🔍 Поиск..." oninput="onMediaSearch()" style="flex:1; min-width:180px;" />
+            <select id="media-genre" onchange="onMediaSearch()">
+                <option value="">Все жанры</option>
+            </select>
+            <select id="media-year-min" onchange="onMediaSearch()">
+                <option value="">Год от</option>
+            </select>
+            <select id="media-year-max" onchange="onMediaSearch()">
+                <option value="">Год до</option>
+            </select>
+            <select id="media-sort" onchange="onMediaSearch()">
+                <option value="title">По названию</option>
+                <option value="year">По году</option>
+                <option value="rating">По рейтингу</option>
+                <option value="added">По добавлению</option>
+            </select>
+            <button onclick="resetMediaFilters()" style="background:var(--bg-button); color:var(--fg); padding:6px 10px; font-size:13px;">Сброс</button>
+        </div>
+        <div id="media-grid" class="media-grid"><div class="loading">Загрузка...</div></div>
+        <div id="media-playlists" class="media-grid" style="display:none;"></div>
+    </div>
+
+    <!-- КИНОАФИША -->
+    <div id="tab-cinema" class="tab-content">
+        <h2>🍿 Киноафиша</h2>
+        <div class="cinema-tabs">
+            <button class="cinema-tab active" onclick="cinemaTab('now_playing', this)">🎬 Сейчас в кино</button>
+            <button class="cinema-tab" onclick="cinemaTab('upcoming', this)">🆕 Скоро</button>
+            <button class="cinema-tab" onclick="cinemaTab('popular', this)">🔥 Популярное</button>
+            <button class="cinema-tab" onclick="cinemaTab('top_rated', this)">⭐ Топ</button>
+            <button class="cinema-tab" onclick="cinemaTab('tv_on_air', this)">📺 Сериалы</button>
+            <button class="cinema-tab" onclick="cinemaTab('wishlist', this)">❤️ Хочу посмотреть</button>
+        </div>
+        <div id="cinema-content" class="cinema-content">
+            <div class="loading">Загрузка...</div>
+        </div>
+        <div class="cinema-pagination" id="cinema-pagination"></div>
+    </div>
+
+    <!-- АВТО-ПЕРЕИМЕНОВАНИЕ -->
+    <div id="rename-modal" class="modal" onclick="if(event.target===this)closeRenameModal()">
+        <div class="settings-panel" style="max-width:820px;">
+            <h3>🔧 Авто-переименование</h3>
+            <div style="display:flex; gap:8px; margin-bottom:12px;">
+                <input type="text" id="rename-search" placeholder="Название фильма..." style="flex:1;" onkeydown="if(event.key==='Enter')renameSearch()">
+                <button onclick="renameSearch()">🔍 Найти</button>
+            </div>
+            <div id="rename-results" style="max-height:40vh; overflow-y:auto;"></div>
+            <div id="rename-preview" style="margin-top:12px;"></div>
+        </div>
+    </div>
+
+    <!-- ЗДОРОВЬЕ (HEALTHCHECK) -->    <div id="tab-health" class="tab-content">
+        <h2>🩺 Здоровье сервисов</h2>
+        <div class="card">
+            <div id="health-summary"></div>
+            <div id="health-services"></div>
+        </div>
+    </div>
+
+    <!-- ФОТО -->
+    <div id="tab-photos" class="tab-content">
+        <h2>🖼️ Фото <span id="photos-count" style="color:var(--fg-dim); font-size:14px;"></span></h2>
+        <div class="photos-controls" style="margin-bottom:14px;">
+            <button onclick="loadPhotos()">🔄 Обновить</button>
+        </div>
+        <div id="photos-groups"></div>
+    </div>
+    <div id="photo-lightbox" class="modal" onclick="if(event.target===this)closeLightbox()">
+        <button class="lightbox-close" onclick="closeLightbox()">✖</button>
+        <button class="lightbox-nav lightbox-prev" onclick="event.stopPropagation(); lightboxNav(-1)">‹</button>
+        <img id="lightbox-img" src="" alt="" />
+        <video id="lightbox-video" controls style="display:none;"></video>
+        <button class="lightbox-nav lightbox-next" onclick="event.stopPropagation(); lightboxNav(1)">›</button>
+        <div id="lightbox-caption" class="lightbox-caption"></div>
+    </div>
+
+    <div id="notification" class="notify"></div>
+
+    <div id="profile-modal" class="modal" onclick="if(event.target===this)this.classList.remove('show')">
+        <div class="album-modal-content" style="max-width:560px;text-align:center;">
+            <h2>👥 Кто смотрит?</h2>
+            <div id="profile-list" style="display:flex;gap:16px;justify-content:center;flex-wrap:wrap;margin:20px 0;"></div>
+            <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;">
+                <input id="new-profile-name" placeholder="Имя профиля" style="padding:8px 10px;background:var(--bg);border:1px solid var(--bg-button);border-radius:6px;color:var(--fg);">
+                <input id="new-profile-pin" placeholder="PIN (необязательно)" style="padding:8px 10px;background:var(--bg);border:1px solid var(--bg-button);border-radius:6px;color:var(--fg);width:140px;">
+                <button onclick="createProfile()">+ Добавить</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="full-player-modal" class="modal" onclick="if(event.target===this)closeFullPlayer()">
+        <div class="album-modal-content" style="max-width:640px;text-align:center;">
+            <button onclick="closeFullPlayer()" class="album-close" style="float:right;margin:0;">✖</button>
+            <img id="fp-cover" src="" title="Открыть альбом"
+                 style="width:320px;height:320px;border-radius:16px;object-fit:cover;background:var(--bg-button);margin:16px auto;display:block;cursor:pointer;"
+                 onclick="openCurrentAlbum()" onerror="this.style.visibility='hidden'">
+            <h2 id="fp-title" style="margin:8px 0;cursor:pointer;" onclick="scrollToCurrentTrack()">—</h2>
+            <a id="fp-artist" href="#" style="font-size:17px;color:var(--fg-muted);text-decoration:none;"
+               onclick="event.preventDefault();openCurrentArtist();">—</a>
+            <div id="fp-album" style="color:var(--fg-dim);font-size:13px;margin:6px 0;"></div>
+            <div style="width:100%;margin:20px 0;">
+                <input type="range" id="fp-seek" min="0" max="1000" value="0" style="width:100%;accent-color:var(--accent);"
+                       oninput="onSeekInput(this.value,true)" onchange="onSeekCommit(this.value)">
+                <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--fg-dim);">
+                    <span id="fp-elapsed">0:00</span><span id="fp-duration">0:00</span>
+                </div>
+            </div>
+            <div style="display:flex;justify-content:center;gap:24px;font-size:34px;align-items:center;margin:16px 0;">
+                <button onclick="musicPrev()" style="background:none;border:none;color:var(--fg);cursor:pointer;font-size:34px;">⏮</button>
+                <button onclick="musicPlayPause()" id="fp-play" style="background:none;border:none;color:var(--accent);cursor:pointer;font-size:46px;">▶️</button>
+                <button onclick="musicNext()" style="background:none;border:none;color:var(--fg);cursor:pointer;font-size:34px;">⏭</button>
+            </div>
+            <div style="display:flex;align-items:center;gap:12px;justify-content:center;">
+                <span>🔊</span>
+                <input type="range" id="fp-volume" min="0" max="100" value="70" style="width:200px;accent-color:var(--accent);" oninput="musicVolume(this.value)">
+            </div>
+            <div style="display:flex;gap:8px;justify-content:center;margin-top:20px;flex-wrap:wrap;">
+                <button onclick="fpAddToPlaylist()">➕ В плейлист</button>
+                <button onclick="openCurrentArtist()">🎤 К артисту</button>
+                <button onclick="openCurrentAlbum()">💿 К альбому</button>
+                <button onclick="fpAddToQueue()">📋 В очередь</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="pwa-player">
+        <img id="pwa-cover" src="" onerror="this.style.display='none'">
+        <h2 id="pwa-title" style="text-align:center;margin:10px 0 0;">—</h2>
+        <p id="pwa-artist" style="color:var(--fg-muted);margin:4px 0;">—</p>
+        <div class="pwa-controls">
+            <button onclick="musicPrev()" style="background:transparent;border:none;color:var(--fg);">⏮</button>
+            <button onclick="musicPlayPause()" style="background:transparent;border:none;color:var(--fg);">⏯</button>
+            <button onclick="musicNext()" style="background:transparent;border:none;color:var(--fg);">⏭</button>
+        </div>
+        <input type="range" id="pwa-volume" min="0" max="100" style="width:80%;margin-top:24px;" onchange="musicVolume(this.value)">
+        <button onclick="location.href='/?pwa=full'" style="margin-top:20px;">Открыть полный UI</button>
+    </div>
+    <div id="modal" class="modal" onclick="this.classList.remove('show')">
+        <img id="modal-img" src="" alt="" />
+    </div>
+    <div id="settings-modal" class="modal" onclick="if(event.target===this)closeSettings()">
+        <div class="settings-panel">
+            <h3>⚙️ Настройки</h3>
+            <label>Тема оформления:
+                <select id="theme-select" onchange="changeTheme(this.value)"></select>
+            </label>
+            <label style="margin-top:4px;">
+                <input type="checkbox" id="auto-next-toggle" onchange="toggleAutoNext(this.checked)" checked style="width:auto;margin-right:8px;" />
+                Авто-следующая серия
+            </label>
+            <div class="settings-actions">
+                <button onclick="closeSettings()">Закрыть</button>
+            </div>
+        </div>
+    </div>
+    <div id="media-modal" class="modal" onclick="if(event.target===this)closeMediaModal()">
+        <div class="media-detail">
+            <img id="media-detail-poster" src="" alt="" />
+            <div class="media-detail-info">
+                <div class="breadcrumbs">
+                    <a onclick="closeMediaModal(); showTab('media')">🎬 Медиа</a>
+                    <span>›</span>
+                    <span id="bc-current">—</span>
+                </div>
+                <h3 id="media-detail-title"></h3>
+                <div id="media-detail-meta"></div>
+                <p id="media-detail-overview"></p>
+                <button onclick="openPlayer(currentMediaId)">▶️ Смотреть</button>
+                <button onclick="openMediaItem()">▶️ VLC</button>
+                <button id="trailer-btn" onclick="openTrailer()" style="display:none; background:var(--bg-button); color:var(--fg);">▶️ Трейлер</button>
+                <button id="match-btn" onclick="openMatchModal()" style="display:none; background:var(--bg-button); color:var(--fg);">🔍 Найти в TMDb</button>
+                <button id="rename-btn" onclick="renamePreview()" style="display:none; background:var(--bg-button); color:var(--fg);">✏️ Переименовать</button>
+                <button id="add-playlist-btn" onclick="promptAddToPlaylist()" style="display:none; background:var(--bg-button); color:var(--fg);">➕ В плейлист</button>
+                <div id="actors-block" class="actors-block" style="display:none;">
+                    <h3>Актёры</h3>
+                    <div id="actors-list" class="actors-list"></div>
+                </div>
+            </div>
+        </div>
+        <div id="similar-block" class="similar-block" style="display:none;">
+            <h3>Похожие</h3>
+            <div id="similar-grid" class="similar-grid"></div>
+        </div>
+    </div>
+    <div id="person-modal" class="modal" onclick="if(event.target===this)closePersonModal()">
+        <div class="person-modal-content">
+            <button class="person-close" onclick="closePersonModal()">✖</button>
+            <div class="person-head">
+                <img id="person-avatar" src="" alt="" style="display:none;" />
+                <h2 id="person-name"></h2>
+            </div>
+            <div id="person-movies" class="media-grid"></div>
+        </div>
+    </div>
+    <div id="torrent-detail-modal" class="modal" onclick="if(event.target===this)closeTorrentDetail()">
+        <div class="torrent-detail-content">
+            <button class="person-close" onclick="closeTorrentDetail()">✖</button>
+            <h2 id="td-title"></h2>
+            <div id="td-progress" class="progress-wrap"></div>
+            <div id="td-meta" class="td-meta"></div>
+            <h3>Трекеры</h3>
+            <div id="td-trackers"></div>
+            <h3>Файлы</h3>
+            <div id="td-files"></div>
+            <button onclick="closeTorrentDetail()" style="margin-top:14px;">✖ Закрыть</button>
+        </div>
+    </div>
+    <div id="match-modal" class="modal" onclick="if(event.target===this)closeMatchModal()">
+        <div class="settings-panel" style="max-width:720px;">
+            <h3>🔍 Сопоставить с TMDb</h3>
+            <div style="display:flex; gap:8px; margin-bottom:12px;">
+                <input type="text" id="match-query" placeholder="Название..." style="flex:1;" onkeydown="if(event.key==='Enter')searchTMDBMatch()" />
+                <button onclick="searchTMDBMatch()">🔍 Найти</button>
+            </div>
+            <div id="match-results" style="display:grid; grid-template-columns:repeat(auto-fill,minmax(130px,1fr)); gap:10px; max-height:50vh; overflow-y:auto;"></div>
+        </div>
+    </div>
+    <div id="series-modal" class="modal" onclick="if(event.target===this)closeSeriesModal()">
+        <div class="series-detail">
+            <div class="series-header">
+                <img id="series-poster" src="" alt="" />
+                <div class="series-info">
+                    <h3 id="series-title"></h3>
+                    <div class="series-meta" id="series-meta"></div>
+                    <p id="series-overview"></p>
+                    <button id="series-subscribe-btn" onclick="subscribeSeries()" style="background:var(--bg-button);color:var(--fg);">🔔 Подписаться на новые серии</button>
+                    <div id="series-actors" class="actors-block" style="display:none;">
+                        <h3>Актёры</h3>
+                        <div id="series-actors-list" class="actors-list"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="season-tabs" id="season-tabs"></div>
+            <div class="episode-list" id="episode-list"></div>
+        </div>
+    </div>
+    <div id="player-modal" class="modal" onclick="if(event.target===this)closePlayer()">
+        <div class="player-wrap">
+            <div id="resume-banner" style="display:none; background:var(--bg-card); color:var(--fg); padding:10px 16px; border-radius:8px; align-items:center; gap:12px; margin-bottom:8px;">
+                <span id="resume-text">Продолжить с 0:00</span>
+                <button onclick="resumePlayback()" style="background:var(--accent);color:var(--bg);">▶️ Продолжить</button>
+                <button onclick="restartPlayback()" style="background:var(--bg-button);color:var(--fg);">Начать сначала</button>
+            </div>
+            <video id="player-video" controls autoplay>
+                <track id="player-track" kind="subtitles" label="Русские" />
+            </video>
+            <div id="transcode-badge" style="display:none; margin-top:8px; background:var(--warning); color:var(--bg); padding:6px 12px; border-radius:8px; font-size:12px; font-weight:600;">
+                ⚠️ Транскод HEVC → H.264 (может тормозить на слабом CPU)
+            </div>
+            <div style="display:flex; align-items:center; gap:8px; margin-top:8px;">
+                <label style="color:var(--fg-muted); font-size:12px;">Субтитры:</label>
+                <select id="subtitle-select" onchange="selectSubtitle(this.value)" style="background:var(--bg-button); color:var(--fg); border:1px solid var(--bg-button-hover); border-radius:4px; padding:4px 8px; font-size:12px;">
+                    <option value="">Выключены</option>
+                </select>
+                <button id="cast-btn" onclick="castVideo()" title="Cast на ТВ" style="display:none; background:var(--bg-button); color:var(--fg); border:none; border-radius:6px; padding:6px 12px; font-size:12px; cursor:pointer;">📺 Cast</button>
+                <button id="player-pip" onclick="togglePiP()" style="background:var(--bg-button); color:var(--fg); border:none; border-radius:6px; padding:6px 12px; font-size:12px; cursor:pointer;">📺 PiP</button>
+                <button id="sb-toggle" onclick="toggleSponsorblock()" title="SponsorBlock (авто-пропуск спонсоров)" style="background:var(--bg-button); color:var(--fg); border:none; border-radius:6px; padding:6px 12px; font-size:12px; cursor:pointer;">⏭ SB</button>
+            </div>
+            <div id="auto-next-overlay" class="auto-next-overlay">
+                <span id="auto-next-title" style="font-size:13px;font-weight:600;"></span>
+                <span style="color:var(--fg-muted);font-size:12px;">через <span id="auto-next-countdown">10</span>с</span>
+                <button onclick="watchNowAutoNext()" style="background:var(--accent);color:var(--bg);">▶️ Сейчас</button>
+                <button onclick="cancelAutoNext()" style="background:var(--bg-button);color:var(--fg);">⏸ Отмена</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/jszip.min.js"></script>
+    <script src="/static/epub.min.js"></script>
+    <script src="/static/app.js"></script>
+    <script src="/static/torrent.js"></script>
+    <script src="/static/media.js"></script>
+    <script src="/static/music.js"></script>
+    <script src="/static/books.js"></script>
+    <script src="/static/init.js"></script>
+</body>
+</html>

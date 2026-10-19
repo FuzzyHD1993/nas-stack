@@ -1,0 +1,10 @@
+[Unit]
+Description=NAS-stack watchdog timer
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

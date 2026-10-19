@@ -1,0 +1,20 @@
+go 1.27.1
+
+use (
+	./auth-service
+	./books-opener
+	./books-service
+	./gateway
+	./history-service
+	./host-agent
+	./internal/platform
+	./media-service
+	./music-service
+	./notify-service
+	./scheduler-service
+	./search-service
+	./stats-service
+	./torrent-service
+	./web-dashboard
+	./youtube-service
+)
