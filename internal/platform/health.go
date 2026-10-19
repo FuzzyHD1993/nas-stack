@@ -23,14 +23,18 @@ func MetricFields() fiber.Map {
 	}
 }
 
-// HealthJSON собирает ответ /health: статус + runtime + дополнительные поля.
+// HealthJSON собирает ответ /health: runtime + дополнительные поля.
+// Сначала накладывается extra, затем системные поля — иначе extra мог бы
+// перетереть status/service или runtime-метрики.
 func HealthJSON(service string, extra fiber.Map) fiber.Map {
-	m := fiber.Map{"status": "ok", "service": service}
-	for k, v := range MetricFields() {
-		m[k] = v
-	}
+	m := fiber.Map{}
 	for k, v := range extra {
 		m[k] = v
 	}
+	for k, v := range MetricFields() {
+		m[k] = v
+	}
+	m["status"] = "ok"
+	m["service"] = service
 	return m
 }

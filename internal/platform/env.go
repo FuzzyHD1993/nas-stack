@@ -19,7 +19,7 @@ func GetEnv(key, def string) string {
 func ValidateEnv(required []string) error {
 	var missing []string
 	for _, k := range required {
-		if os.Getenv(k) == "" {
+		if strings.TrimSpace(os.Getenv(k)) == "" {
 			missing = append(missing, k)
 		}
 	}

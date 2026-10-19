@@ -225,18 +225,20 @@ func main() {
 		if !isSafeURL(coverURL) {
 			// SSRF: /cover?url=http://gateway:8080/health или
 			// /cover?url=http://169.254.169.254/latest/meta-data/ не пройдут.
-			return c.Status(400).JSON(fiber.Map{"error": "url is not allowed: " + coverURL})
+			return c.Status(400).JSON(fiber.Map{"error": "url is not allowed"})
 		}
 
 		client := makeClient()
 		req, err := newRequest("GET", coverURL)
 		if err != nil {
-			return c.Status(500).SendString(err.Error())
+			log.Printf("cover: %v", err)
+			return c.Status(500).SendString("internal error")
 		}
 
 		resp, err := client.Do(req)
 		if err != nil {
-			return c.Status(502).SendString(err.Error())
+			log.Printf("cover upstream: %v", err)
+			return c.Status(502).SendString("upstream unavailable")
 		}
 		defer func() { _ = resp.Body.Close() }()
 
@@ -244,11 +246,15 @@ func main() {
 			return c.Status(resp.StatusCode).SendString("upstream error")
 		}
 
-		contentType := resp.Header.Get("Content-Type")
-		if contentType == "" {
+		contentType := strings.ToLower(strings.TrimSpace(
+			strings.SplitN(resp.Header.Get("Content-Type"), ";", 2)[0]))
+		switch contentType {
+		case "image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif", "image/avif":
+		default:
 			contentType = "image/jpeg"
 		}
 		c.Set("Content-Type", contentType)
+		c.Set("X-Content-Type-Options", "nosniff")
 		c.Set("Cache-Control", "public, max-age=86400")
 
 		body, _ := io.ReadAll(resp.Body)

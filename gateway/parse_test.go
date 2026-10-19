@@ -15,6 +15,8 @@ func TestParseSmartQuery(t *testing.T) {
 		{"genre_comedy_ru", "комедия", map[string]interface{}{"genre": "комеди"}},
 		{"genre_comedy_en", "comedy movie", map[string]interface{}{"genre": "комеди"}},
 		{"genre_action", "боевик", map[string]interface{}{"genre": "боевик"}},
+		{"genre_melodrama", "мелодрама", map[string]interface{}{"genre": "мелодрам"}},
+		{"genre_multi_keyword", "комедия боевик", map[string]interface{}{"genre": "комеди"}},
 		{"runtime_minutes", "фильм 90 минут", map[string]interface{}{"runtime_max": 100}},
 		{"runtime_short", "что-то короткое", map[string]interface{}{"runtime_max": 90}},
 		{"runtime_long", "длинный фильм", map[string]interface{}{"runtime_min": 150}},
@@ -46,16 +48,29 @@ func TestParseSmartQueryLimit(t *testing.T) {
 	}
 }
 
+func TestParseSmartQueryGenreDeterministic(t *testing.T) {
+	// Регрессия: обход genreMap давал случайный жанр для ввода, матчащего
+	// несколько ключей ("мелодрама" содержит и "драма", и "мелодрам").
+	for i := 0; i < 100; i++ {
+		if got := parseSmartQuery("мелодрама")["genre"]; got != "мелодрам" {
+			t.Fatalf("итерация %d: genre = %v, want мелодрам", i, got)
+		}
+	}
+}
+
 func TestEnvExampleHasRequired(t *testing.T) {
 	data, err := os.ReadFile("../.env.example")
 	if err != nil {
-		t.Skipf(".env.example недоступен: %v", err)
+		t.Fatalf(".env.example недоступен: %v", err)
 	}
 	content := string(data)
 	for _, k := range []string{
 		"NAS_ROOT", "LIBRARY_ROOT", "TMDB_API_KEY", "PROWLARR_API_KEY",
 		"POSTGRES_URL", "REDIS_ADDR", "JWT_SECRET", "NAS_HOST",
 		"MEDIA_MOVIES_HOST_DIR", "MUSIC_HOST_DIR", "TZ",
+		// host-exec ручки закрыты ADMIN_TOKEN/NOTIFY_GATEWAY_TOKEN,
+		// а host-agent обязан биндиться на локальный интерфейс.
+		"ADMIN_TOKEN", "NOTIFY_GATEWAY_TOKEN", "HOST_AGENT_BIND",
 	} {
 		if !strings.Contains(content, k+"=") {
 			t.Errorf(".env.example не содержит %s=", k)

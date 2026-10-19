@@ -3,8 +3,10 @@ package main
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/url"
+	pathpkg "path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -33,12 +35,20 @@ var adminToken string
 // неизвестный токен, напечатанный в лог, означает, что UI работать не будет, а
 // админские ручки молча закроются. Лучше упасть на старте с понятным текстом,
 // чем работать «в половинку». Сгенерировать: openssl rand -hex 32 -> ADMIN_TOKEN.
-func loadAdminToken() string {
-	t := strings.TrimSpace(platform.GetEnv("ADMIN_TOKEN", ""))
+func adminTokenFromEnv(getenv func(string) string) (string, error) {
+	t := strings.TrimSpace(getenv("ADMIN_TOKEN"))
 	if t == "" {
-		log.Fatal("❌ ADMIN_TOKEN не задан. Без него закрыты host-exec ручки " +
+		return "", errors.New("ADMIN_TOKEN не задан. Без него закрыты host-exec ручки " +
 			"(/notify/update/*, /notify/env*, /scheduler/update/*). " +
 			"Добавьте в .env: ADMIN_TOKEN=<openssl rand -hex 32>")
+	}
+	return t, nil
+}
+
+func loadAdminToken() string {
+	t, err := adminTokenFromEnv(func(k string) string { return platform.GetEnv(k, "") })
+	if err != nil {
+		log.Fatal("❌ ", err)
 	}
 	return t
 }
@@ -81,6 +91,57 @@ func adminAuth(c fiber.Ctx) error {
 	})
 }
 
+// canonicalProxyPath приводит путь к виду, который увидит upstream:
+// повторно декодирует %XX, нормализует разделители и схлопывает //, /./ и /../.
+// Без этого /notify/update%252Frun обходил adminProtectedPath.
+func canonicalProxyPath(p string) string {
+	p = strings.TrimSpace(p)
+	for i := 0; i < 3; i++ {
+		u, err := url.PathUnescape(p)
+		if err != nil || u == p {
+			break
+		}
+		p = u
+	}
+	p = strings.ReplaceAll(p, "\\", "/")
+	if strings.ContainsRune(p, '\x00') {
+		return ""
+	}
+	p = pathpkg.Clean("/" + p)
+	p = strings.TrimPrefix(p, "/")
+	if p == "." {
+		return ""
+	}
+	return p
+}
+
+// validateProxyPath отклоняет пути, которые после декодирования содержат
+// traversal-сегменты. Окончательный путь на upstream строится из исходного,
+// но admin-проверки используют canonicalProxyPath.
+func validateProxyPath(raw string) error {
+	p := strings.TrimSpace(raw)
+	for i := 0; i < 3; i++ {
+		u, err := url.PathUnescape(p)
+		if err != nil {
+			return errors.New("invalid path encoding")
+		}
+		if u == p {
+			break
+		}
+		p = u
+	}
+	p = strings.ReplaceAll(p, "\\", "/")
+	if strings.ContainsRune(p, '\x00') {
+		return errors.New("invalid path")
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == ".." {
+			return errors.New("path traversal")
+		}
+	}
+	return nil
+}
+
 // adminProtectedPath — ручки проксируемых сервисов, дающие host-exec или
 // доступ к секретам. Вызывается и в proxyHandler (defense in depth: даже если
 // префикс middleware не совпал, запрос с host-exec не уйдёт дальше).
@@ -92,7 +153,7 @@ func adminProtectedPath(service, method, path string) bool {
 	if !adminProxyService(service) {
 		return false
 	}
-	p := strings.ToLower(strings.Trim(strings.TrimSpace(path), "/"))
+	p := strings.ToLower(canonicalProxyPath(path))
 	if p == "" {
 		return false
 	}
@@ -116,11 +177,55 @@ func adminProxyService(name string) bool { return name == "notify" || name == "s
 // БЕЗ adminAuth: /notify/send — обычные уведомления (их шлют сервисы стека:
 // stats/media/torrent), host-exec там нет, и закрывать их админ-токеном нельзя.
 func serviceTokenPath(service, method, path string) bool {
-	p := strings.ToLower(strings.Trim(strings.TrimSpace(path), "/"))
+	p := strings.ToLower(canonicalProxyPath(path))
 	if service != "notify" {
 		return false
 	}
 	return p == "send" && (method == "POST" || method == "PUT")
+}
+
+// requireAuthMiddleware проверяет JWT. Разрешён только HS256: без явной
+// проверки алгоритма alg=none и чужие схемы ломают аутентификацию.
+func requireAuthMiddleware(jwtSecret []byte, authEnabled bool) fiber.Handler {
+	return func(c fiber.Ctx) error {
+		if !authEnabled {
+			return c.Next()
+		}
+		// Валидный ADMIN_TOKEN — самостоятельный доступ: он идёт в том же
+		// заголовке Authorization, что и JWT, и в админ-вызовах UI заменяет его.
+		if adminTokenOK(c) {
+			return c.Next()
+		}
+
+		auth := c.Get("Authorization")
+		if !strings.HasPrefix(auth, "Bearer ") {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "no token"})
+		}
+		tokenStr := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+
+		token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
+			if t.Method.Alg() != jwt.SigningMethodHS256.Alg() {
+				return nil, jwt.ErrSignatureInvalid
+			}
+			return jwtSecret, nil
+		}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
+		if err != nil || !token.Valid {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid token"})
+		}
+		return c.Next()
+	}
+}
+
+// sanitizeImageContentType не пропускает произвольный Content-Type upstream:
+// text/html с этого роута браузер иначе отрендерит как HTML.
+func sanitizeImageContentType(ct string) string {
+	ct = strings.ToLower(strings.TrimSpace(strings.SplitN(ct, ";", 2)[0]))
+	switch ct {
+	case "image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif", "image/avif":
+		return ct
+	default:
+		return "image/jpeg"
+	}
 }
 
 func main() {
@@ -131,7 +236,15 @@ func main() {
 	app.Use(metricsMiddleware())
 	app.Use(logger.New())
 
-	app.Get("/metrics", adaptor.HTTPHandler(promhttp.Handler()))
+	// /metrics не публикуется на :8080: отдельный listener :9091 доступен
+	// только внутри docker-сети (prometheus.yml).
+	metricsApp := fiber.New(fiber.Config{AppName: "NAS Gateway Metrics"})
+	metricsApp.Get("/metrics", adaptor.HTTPHandler(promhttp.Handler()))
+	go func() {
+		if err := metricsApp.Listen(":9091"); err != nil {
+			log.Printf("metrics listener: %v", err)
+		}
+	}()
 
 	statsURL := platform.GetEnv("STATS_SERVICE_URL", "http://localhost:8082")
 	torrentURL := platform.GetEnv("TORRENT_SERVICE_URL", "http://localhost:8081")
@@ -146,6 +259,9 @@ func main() {
 	musicURL := platform.GetEnv("MUSIC_SERVICE_URL", "http://localhost:8092")
 	jwtSecret := []byte(platform.GetEnv("JWT_SECRET", "change-me-in-production"))
 	authEnabled := platform.GetEnv("AUTH_ENABLED", "false") == "true"
+	if authEnabled && string(jwtSecret) == "change-me-in-production" {
+		log.Fatal("❌ AUTH_ENABLED=true, но JWT_SECRET не задан (используется дефолт change-me-in-production)")
+	}
 
 	// Секрет для доступа к notify-service host-exec ручкам (/update/*, /env).
 	notifyToken = strings.TrimSpace(platform.GetEnv("NOTIFY_GATEWAY_TOKEN", ""))
@@ -192,51 +308,36 @@ func main() {
 	// ============================================================
 	// JWT MIDDLEWARE (опциональный)
 	// ============================================================
-	requireAuth := func(c fiber.Ctx) error {
-		if !authEnabled {
-			return c.Next()
-		}
-		// Валидный ADMIN_TOKEN — самостоятельный доступ: он идёт в том же
-		// заголовке Authorization, что и JWT, и в админ-вызовах UI заменяет его.
-		if adminTokenOK(c) {
-			return c.Next()
-		}
-
-		auth := c.Get("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") {
-			return c.Status(401).JSON(fiber.Map{"error": "no token"})
-		}
-		tokenStr := strings.TrimPrefix(auth, "Bearer ")
-
-		token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
-			return jwtSecret, nil
-		})
-		if err != nil || !token.Valid {
-			return c.Status(401).JSON(fiber.Map{"error": "invalid token"})
-		}
-		return c.Next()
-	}
+	requireAuth := requireAuthMiddleware(jwtSecret, authEnabled)
 
 	// ============================================================
 	// ПРОКСИОБЛОЖКИ (публичный, без auth)
 	// ============================================================
 	app.Get("/books/cover", func(c fiber.Ctx) error {
-		coverURL := c.Query("url")
+		coverURL := strings.TrimSpace(c.Query("url"))
 		if coverURL == "" {
-			return c.Status(400).SendString("url is required")
+			return c.Status(fiber.StatusBadRequest).SendString("url is required")
 		}
+		u, err := url.Parse(coverURL)
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+			return c.Status(fiber.StatusBadRequest).SendString("invalid url: only http/https allowed")
+		}
+
 		cc := client.New()
 		resp, err := cc.Get(booksURL+"/cover?url="+url.QueryEscape(coverURL), client.Config{
 			Timeout: 15 * time.Second,
 		})
 		if err != nil {
-			return c.Status(502).SendString(err.Error())
+			log.Printf("books/cover: %v", err)
+			return c.Status(fiber.StatusBadGateway).SendString("cover service unavailable")
 		}
-		contentType := resp.Header("Content-Type")
-		if contentType == "" {
-			contentType = "image/jpeg"
+		if resp.StatusCode() != fiber.StatusOK {
+			log.Printf("books/cover: upstream status %d", resp.StatusCode())
+			return c.Status(resp.StatusCode()).SendString("upstream error")
 		}
-		c.Set("Content-Type", contentType)
+
+		c.Set("Content-Type", sanitizeImageContentType(resp.Header("Content-Type")))
+		c.Set("X-Content-Type-Options", "nosniff")
 		c.Set("Cache-Control", "public, max-age=86400")
 		return c.Send(resp.Body())
 	})
@@ -305,13 +406,19 @@ func main() {
 			Query string `json:"query"`
 		}
 		if err := c.Bind().JSON(&req); err != nil {
-			return c.Status(400).JSON(fiber.Map{"error": "bad json"})
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "bad json"})
+		}
+		if strings.TrimSpace(req.Query) == "" {
+			return c.JSON(fiber.Map{"movies": []fiber.Map{}, "count": 0, "params": fiber.Map{}})
 		}
 		params := parseSmartQuery(req.Query)
 		if len(params) == 0 {
 			return c.JSON(fiber.Map{"movies": []fiber.Map{}, "count": 0, "params": params})
 		}
-		body, _ := json.Marshal(params)
+		body, err := json.Marshal(params)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "internal error"})
+		}
 		cc := client.New()
 		resp, err := cc.Post(mediaURL+"/movies/smart", client.Config{
 			Timeout: 15 * time.Second,
@@ -319,7 +426,8 @@ func main() {
 			Body:    body,
 		})
 		if err != nil {
-			return c.Status(502).JSON(fiber.Map{"error": err.Error()})
+			log.Printf("search/smart: media-service: %v", err)
+			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "media-service unavailable"})
 		}
 		return c.Status(resp.StatusCode()).Send(resp.Body())
 	})
@@ -381,12 +489,15 @@ func main() {
 // ============================================================
 func proxyHandler(baseURL, name string) fiber.Handler {
 	return func(c fiber.Ctx) error {
-		path := c.Params("*")
-		target := baseURL + "/" + path
+		proxyPath := c.Params("*")
+		if err := validateProxyPath(proxyPath); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid path"})
+		}
+		target := baseURL + "/" + proxyPath
 
 		// Host-exec через прокси — только по ADMIN_TOKEN (дублирует middleware,
 		// чтобы защита не зависела от семантики префиксов Use).
-		if adminProxyService(name) && adminProtectedPath(name, c.Method(), path) && !adminTokenOK(c) {
+		if adminProxyService(name) && adminProtectedPath(name, c.Method(), proxyPath) && !adminTokenOK(c) {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 				"error": "admin token required: send 'Authorization: Bearer <ADMIN_TOKEN>'",
 			})
@@ -424,7 +535,7 @@ func proxyHandler(baseURL, name string) fiber.Handler {
 		// перепроверить токен перед вызовом host-agent.
 		delete(cfg.Header, "X-Gateway-Token")
 		delete(cfg.Header, "X-Admin-Token")
-		if adminProxyService(name) && adminProtectedPath(name, c.Method(), path) {
+		if adminProxyService(name) && adminProtectedPath(name, c.Method(), proxyPath) {
 			// admin-ручка: сервисный + админский токен (клиент уже прошёл adminAuth).
 			if name == "notify" && notifyToken != "" {
 				cfg.Header["X-Gateway-Token"] = notifyToken
@@ -432,7 +543,7 @@ func proxyHandler(baseURL, name string) fiber.Handler {
 			if adminToken != "" {
 				cfg.Header["X-Admin-Token"] = adminToken
 			}
-		} else if serviceTokenPath(name, c.Method(), path) {
+		} else if serviceTokenPath(name, c.Method(), proxyPath) {
 			// /notify/send: только сервисный токен, adminAuth не требуется.
 			if notifyToken != "" {
 				cfg.Header["X-Gateway-Token"] = notifyToken
@@ -463,10 +574,10 @@ func proxyHandler(baseURL, name string) fiber.Handler {
 		}
 
 		if err != nil {
-			return c.Status(502).JSON(fiber.Map{
+			log.Printf("proxy %s: %v", name, err)
+			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{
 				"error":   "service unavailable",
 				"service": name,
-				"detail":  err.Error(),
 			})
 		}
 
@@ -483,34 +594,70 @@ func proxyHandler(baseURL, name string) fiber.Handler {
 	}
 }
 
+// smartGenres — упорядоченный список жанровых триггеров. Порядок важен:
+// обход map в Go рандомизирован, из-за чего "мелодрама" (содержит и "драма",
+// и "мелодрам") давала случайный жанр. Более специфичные ключи идут раньше.
+var smartGenres = []struct{ keyword, genre string }{
+	{"мелодрам", "мелодрам"}, {"romance", "мелодрам"},
+	{"комеди", "комеди"}, {"comedy", "комеди"},
+	{"боевик", "боевик"}, {"action", "боевик"},
+	{"драма", "драм"}, {"drama", "драм"},
+	{"фантаст", "фантаст"}, {"sci-fi", "фантаст"},
+	{"триллер", "триллер"}, {"thriller", "триллер"},
+	{"ужас", "ужас"}, {"horror", "ужас"},
+	{"анимац", "анимац"}, {"мульт", "анимац"},
+	{"детектив", "детектив"}, {"mystery", "детектив"},
+	{"криминал", "криминал"}, {"crime", "криминал"},
+}
+
+var (
+	smartMinutesRe = regexp.MustCompile(`(\d+)\s*мин`)
+	smartYearRe    = regexp.MustCompile(`(?:19|20)\d{2}`)
+)
+
+const (
+	smartMaxRuntime = 24 * 60 // минуты
+	smartLimit      = 50
+)
+
 // parseSmartQuery превращает свободную фразу в параметры поиска фильмов.
 func parseSmartQuery(q string) map[string]interface{} {
 	q = strings.ToLower(q)
 	p := map[string]interface{}{}
-	genreMap := map[string]string{
-		"комеди": "комеди", "comedy": "комеди", "боевик": "боевик", "action": "боевик",
-		"драма": "драм", "drama": "драм", "фантаст": "фантаст", "sci-fi": "фантаст",
-		"триллер": "триллер", "thriller": "триллер", "ужас": "ужас", "horror": "ужас",
-		"мелодрам": "мелодрам", "romance": "мелодрам", "анимац": "анимац", "мульт": "анимац",
-		"детектив": "детектив", "mystery": "детектив", "криминал": "криминал", "crime": "криминал",
-	}
-	for k, v := range genreMap {
-		if strings.Contains(q, k) {
-			p["genre"] = v
+	for _, g := range smartGenres {
+		if strings.Contains(q, g.keyword) {
+			p["genre"] = g.genre
 			break
 		}
 	}
-	if strings.Contains(q, "коротк") || strings.Contains(q, "быстр") {
-		p["runtime_max"] = 90
-	}
-	if strings.Contains(q, "длинн") {
-		p["runtime_min"] = 150
-	}
-	if m := regexp.MustCompile(`(\d+)\s*мин`).FindStringSubmatch(q); len(m) == 2 {
-		if n, _ := strconv.Atoi(m[1]); n > 0 {
+
+	// Явно указанные минуты приоритетнее слов «короткий»/«длинный».
+	explicitRuntime := false
+	if m := smartMinutesRe.FindStringSubmatch(q); len(m) == 2 {
+		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
+			if n > smartMaxRuntime {
+				n = smartMaxRuntime
+			}
 			p["runtime_max"] = n + 10
+			explicitRuntime = true
 		}
 	}
+	if !explicitRuntime {
+		if strings.Contains(q, "коротк") || strings.Contains(q, "быстр") {
+			p["runtime_max"] = 90
+		}
+		if strings.Contains(q, "длинн") {
+			p["runtime_min"] = 150
+		}
+	}
+	// Противоречивый диапазон («короткий длинный фильм») не отправляем.
+	if min, ok := p["runtime_min"].(int); ok {
+		if max, ok := p["runtime_max"].(int); ok && max <= min {
+			delete(p, "runtime_min")
+			delete(p, "runtime_max")
+		}
+	}
+
 	if strings.Contains(q, "шедевр") {
 		p["rating_min"] = 8.0
 	} else if strings.Contains(q, "хорош") || strings.Contains(q, "лучш") {
@@ -529,12 +676,12 @@ func parseSmartQuery(q string) map[string]interface{} {
 			p["genre"] = "драм"
 		}
 	}
-	if y := regexp.MustCompile(`(19|20)\d{2}`).FindString(q); y != "" {
-		if n, _ := strconv.Atoi(y); n > 0 {
+	if y := smartYearRe.FindString(q); y != "" {
+		if n, err := strconv.Atoi(y); err == nil && n > 0 {
 			p["year_from"] = n
 			p["year_to"] = n
 		}
 	}
-	p["limit"] = 50
+	p["limit"] = smartLimit
 	return p
 }

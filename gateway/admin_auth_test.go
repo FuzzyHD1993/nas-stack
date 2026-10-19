@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -35,6 +36,7 @@ func do(t *testing.T, app *fiber.App, method, target string, headers map[string]
 	if err != nil {
 		t.Fatalf("app.Test %s %s: %v", method, target, err)
 	}
+	t.Cleanup(func() { _ = resp.Body.Close() })
 	return resp
 }
 
@@ -56,9 +58,9 @@ func TestAdminRoutesRequireToken(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			calls := 0
+			var calls atomic.Int32
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				calls++
+				calls.Add(1)
 				w.WriteHeader(200)
 				_, _ = w.Write([]byte(`{}`))
 			}))
@@ -69,8 +71,8 @@ func TestAdminRoutesRequireToken(t *testing.T) {
 			if resp.StatusCode != 401 {
 				t.Fatalf("без токена: статус %d, ожидался 401", resp.StatusCode)
 			}
-			if calls != 0 {
-				t.Fatalf("запрос без токена дошёл до сервиса (%d вызовов)", calls)
+			if n := calls.Load(); n != 0 {
+				t.Fatalf("запрос без токена дошёл до сервиса (%d вызовов)", n)
 			}
 
 			// С валидным токеном — 200 и запрос уходит.
@@ -78,8 +80,8 @@ func TestAdminRoutesRequireToken(t *testing.T) {
 			if resp.StatusCode != 200 {
 				t.Fatalf("с токеном: статус %d, ожидался 200", resp.StatusCode)
 			}
-			if calls != 1 {
-				t.Fatalf("с валидным токеном сервис не вызван (calls=%d)", calls)
+			if n := calls.Load(); n != 1 {
+				t.Fatalf("с валидным токеном сервис не вызван (calls=%d)", n)
 			}
 
 			// Неверный токен — тоже 401.
@@ -87,8 +89,8 @@ func TestAdminRoutesRequireToken(t *testing.T) {
 			if resp.StatusCode != 401 {
 				t.Fatalf("с неверным токеном: статус %d, ожидался 401", resp.StatusCode)
 			}
-			if calls != 1 {
-				t.Fatalf("неверный токен дошёл до сервиса (calls=%d)", calls)
+			if n := calls.Load(); n != 1 {
+				t.Fatalf("неверный токен дошёл до сервиса (calls=%d)", n)
 			}
 		})
 	}
@@ -114,9 +116,9 @@ func TestAdminRoutesAcceptXAdminTokenHeader(t *testing.T) {
 func TestNoBlindServiceToken(t *testing.T) {
 	withSecrets(t, "admin-secret", "notify-secret")
 
-	var got string
+	var got lockedString
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got = r.Header.Get("X-Gateway-Token") + "|" + r.Header.Get("X-Admin-Token")
+		got.Set(r.Header.Get("X-Gateway-Token") + "|" + r.Header.Get("X-Admin-Token"))
 		w.WriteHeader(200)
 		_, _ = w.Write([]byte(`{}`))
 	}))
@@ -125,8 +127,8 @@ func TestNoBlindServiceToken(t *testing.T) {
 	app := newNotifyApp(t, upstream.URL, "notify")
 	for _, target := range []string{"/notify/health", "/notify/oom-check", "/notify/send/not-a-handler"} {
 		do(t, app, "GET", target, nil)
-		if got != "|" {
-			t.Fatalf("%s: сервисный секрет подставлен без adminAuth (%q)", target, got)
+		if v := got.Get(); v != "|" {
+			t.Fatalf("%s: сервисный секрет подставлен без adminAuth (%q)", target, v)
 		}
 	}
 }
@@ -135,10 +137,10 @@ func TestNoBlindServiceToken(t *testing.T) {
 func TestNotifySendGetsServiceTokenWithoutAdmin(t *testing.T) {
 	withSecrets(t, "admin-secret", "notify-secret")
 
-	var gotToken, gotAdmin string
+	var gotToken, gotAdmin lockedString
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotToken = r.Header.Get("X-Gateway-Token")
-		gotAdmin = r.Header.Get("X-Admin-Token")
+		gotToken.Set(r.Header.Get("X-Gateway-Token"))
+		gotAdmin.Set(r.Header.Get("X-Admin-Token"))
 		w.WriteHeader(200)
 		_, _ = w.Write([]byte(`{}`))
 	}))
@@ -148,11 +150,11 @@ func TestNotifySendGetsServiceTokenWithoutAdmin(t *testing.T) {
 	if resp := do(t, app, "POST", "/notify/send", map[string]string{"Content-Type": "application/json"}); resp.StatusCode != 200 {
 		t.Fatalf("/notify/send без admin-токена: статус %d, ожидался 200", resp.StatusCode)
 	}
-	if gotToken != "notify-secret" {
-		t.Fatalf("/notify/send: X-Gateway-Token=%q, ожидался %q", gotToken, "notify-secret")
+	if v := gotToken.Get(); v != "notify-secret" {
+		t.Fatalf("/notify/send: X-Gateway-Token=%q, ожидался %q", v, "notify-secret")
 	}
-	if gotAdmin != "" {
-		t.Fatalf("/notify/send: X-Admin-Token не должен подставляться, получено %q", gotAdmin)
+	if v := gotAdmin.Get(); v != "" {
+		t.Fatalf("/notify/send: X-Admin-Token не должен подставляться, получено %q", v)
 	}
 }
 
@@ -160,9 +162,9 @@ func TestNotifySendGetsServiceTokenWithoutAdmin(t *testing.T) {
 func TestClientCannotInjectServiceToken(t *testing.T) {
 	withSecrets(t, "admin-secret", "notify-secret")
 
-	var got string
+	var got lockedString
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got = r.Header.Get("X-Gateway-Token")
+		got.Set(r.Header.Get("X-Gateway-Token"))
 		w.WriteHeader(200)
 		_, _ = w.Write([]byte(`{}`))
 	}))
@@ -171,16 +173,16 @@ func TestClientCannotInjectServiceToken(t *testing.T) {
 	app := newNotifyApp(t, upstream.URL, "notify")
 	// Клиент шлёт свой X-Gateway-Token — gateway обязан его перебить своим.
 	do(t, app, "POST", "/notify/send", map[string]string{"X-Gateway-Token": "attacker"})
-	if got != "notify-secret" {
-		t.Fatalf("клиентский X-Gateway-Token не перебит: сервис получил %q", got)
+	if v := got.Get(); v != "notify-secret" {
+		t.Fatalf("клиентский X-Gateway-Token не перебит: сервис получил %q", v)
 	}
 
 	// В админскую ручку клиентский сервисный токен тоже не проходит.
-	got = ""
+	got.Set("")
 	do(t, app, "POST", "/notify/env", map[string]string{
 		"X-Gateway-Token": "attacker", "X-Admin-Token": "admin-secret"})
-	if got != "notify-secret" {
-		t.Fatalf("админ-ручка: сервис получил X-Gateway-Token=%q, ожидался %q", got, "notify-secret")
+	if v := got.Get(); v != "notify-secret" {
+		t.Fatalf("админ-ручка: сервис получил X-Gateway-Token=%q, ожидался %q", v, "notify-secret")
 	}
 }
 

@@ -12,5 +12,5 @@ FROM alpine:latest
 RUN apk add --no-cache ca-certificates
 WORKDIR /app
 COPY --from=builder /out/gateway .
-EXPOSE 8080
+EXPOSE 8080 9091
 CMD ["./gateway"]

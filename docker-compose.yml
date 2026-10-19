@@ -458,6 +458,8 @@ services:
       - "host.containers.internal:host-gateway"
     ports:
       - "8080:8080"
+    expose:
+      - "9091"
     environment:
       - STATS_SERVICE_URL=http://stats-service:8082
       - TORRENT_SERVICE_URL=http://torrent-service:8081

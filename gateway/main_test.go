@@ -1,7 +1,6 @@
 package main
 
 import (
-	"os"
 	"testing"
 
 	"github.com/FuzzyHD1993/nas-stack/internal/platform"
@@ -9,6 +8,9 @@ import (
 )
 
 func TestGetEnv(t *testing.T) {
+	// t.Setenv автоматически восстанавливает исходное значение и делает
+	// мутацию env безопасной для параллельных тестов пакета.
+	t.Setenv("__NAS_TEST_MISSING__", "")
 	if got := platform.GetEnv("__NAS_TEST_MISSING__", "def"); got != "def" {
 		t.Fatalf("getEnv default = %q, want %q", got, "def")
 	}
@@ -33,12 +35,11 @@ func TestHealthJSON(t *testing.T) {
 }
 
 func TestValidateEnv(t *testing.T) {
-	os.Unsetenv("__V101_REQUIRED__")
+	t.Setenv("__V101_REQUIRED__", "")
 	if err := platform.ValidateEnv([]string{"__V101_REQUIRED__"}); err == nil {
 		t.Error("ожидалась ошибка для отсутствующей переменной")
 	}
-	os.Setenv("__V101_REQUIRED__", "x")
-	defer os.Unsetenv("__V101_REQUIRED__")
+	t.Setenv("__V101_REQUIRED__", "x")
 	if err := platform.ValidateEnv([]string{"__V101_REQUIRED__"}); err != nil {
 		t.Errorf("неожиданная ошибка: %v", err)
 	}

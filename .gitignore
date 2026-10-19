@@ -44,3 +44,4 @@ host-agent/host-agent
 .env.bak*
 *.bak.*
 build/
+*.docx
