@@ -29,6 +29,18 @@ fi
 
 UNHEALTHY=$(podman ps --filter health=unhealthy --format "{{.Names}}" 2>/dev/null)
 
+# Rootless-сеть podman. Если в rootless netns нет IPv4-маршрута, контейнеры
+# живут без DNS и без интернета и не видят хост (host.containers.internal).
+# Перезапуск контейнеров тут не помогает — нужен пересозданный netns.
+if ! bash "$REPO_DIR/scripts/ensure-rootless-net.sh" >/dev/null 2>&1; then
+    echo "⚠️ Rootless-сеть podman сломана — пересоздаю netns и стек"
+    notify "⚠️ Rootless-сеть podman сломана — пересоздаю" "warning"
+    bash "$REPO_DIR/scripts/ensure-rootless-net.sh" --repair >/dev/null 2>&1
+    podman compose up -d >/dev/null 2>&1
+    notify "✅ Rootless-сеть podman пересоздана, стек поднят" "info"
+    exit 0
+fi
+
 if [ -n "$UNHEALTHY" ]; then
     echo "⚠️ Unhealthy: $UNHEALTHY"
     for c in $UNHEALTHY; do

@@ -324,6 +324,16 @@ echo "🚀 Запуск NAS-Stack..."
 log "Сброс сети (DNS/port-forward)..."
 "$PODMAN" network reload --all >/dev/null 2>&1 || true
 
+# Пре-флайт: rootless netns должен иметь IPv4-маршрут по умолчанию. Если он
+# создан на старте ОС (когда сеть хоста ещё не поднята), сеть остаётся без
+# маршрута навсегда: контейнеры без DNS/интернета и без доступа к хосту
+# (host.containers.internal -> notify-service :8083). Лечим пересозданием.
+log "Проверка rootless-сети podman..."
+if ! bash "$SCRIPT_DIR/ensure-rootless-net.sh" >/dev/null 2>&1; then
+    warn "rootless-сеть podman без IPv4-маршрута — пересоздаю"
+    bash "$SCRIPT_DIR/ensure-rootless-net.sh" --repair || true
+fi
+
 log "1/7 Зависимости: postgres, redis"
 "$PODMAN" compose up -d postgres redis
 if ! ensure_healthy nas-postgres 90; then

@@ -1,3 +1,29 @@
+# NAS Stack v1.5.2
+
+Релиз инфраструктурных фиксов rootless-Podman. Метка `v1.5.2` перевыпущена:
+в прежней версии был неполный набор правок.
+
+## 🐞 Исправлено
+
+- **systemd больше не убивает conmon'ы контейнеров.** `nas-stack.service` и
+  `nas-stack-watchdog.service` получили `KillMode=process`: раньше при
+  остановке oneshot-юнита systemd делал `SIGKILL` дочерним conmon'ам, и
+  контейнеры оставались «Up» без init-процесса (healthcheck → exit 1,
+  `podman exec` → *cannot exec in a stopped container*).
+- **Сеть стека на rootless Podman.** Rootless netns, созданный до готовности
+  сети хоста, оставался без IPv4-маршрута: контейнеры теряли DNS и интернет и
+  не видели хост (`host.containers.internal` → notify-service `:8083`).
+  Новый `scripts/ensure-rootless-net.sh` проверяет и чинит netns; его зовут
+  `scripts/start-stack.sh` (пре-флайт) и `scripts/watchdog.sh` (каждые 5 минут).
+- **`scripts/start-stack.sh` больше не считает упавшими `auth-service`
+  (`:8086`), `media-service` (`:8091`) и `music-service` (`:8092`)** — они
+  намеренно не публикуются на хост, и проверка через `127.0.0.1` давала ложный
+  «упавший сервис», из-за чего юнит старта всегда падал с `exit 1`.
+- **`notify-service` явно слушает `0.0.0.0:8083`.**
+- **MPD виден из `music-service`** (`MPD_ADDR=host.containers.internal:6600`).
+
+---
+
 # NAS Stack v1.0.0-beta
 
 Первая публичная бета self-hosted платформы для домашнего NAS.

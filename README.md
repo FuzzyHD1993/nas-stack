@@ -740,6 +740,18 @@ nas-stack/
 - **Healthcheck контейнера вечно `(starting)`/`unhealthy`.** `wget` в alpine для
   `localhost` может уйти в IPv6 (`::1`), а сервис слушает IPv4. В healthcheck используйте
   `http://127.0.0.1:<port>/health`.
+- **Контейнеры без DNS и интернета, `host.containers.internal` недоступен.**
+  Проверьте маршрут в rootless netns:
+  ```bash
+  podman unshare --rootless-netns ip -4 route show default
+  ```
+  Пустая строка — сеть стека осталась без IPv4-маршрута (обычно netns создан
+  на старте ОС, когда сеть хоста ещё не поднята). Починить:
+  ```bash
+  scripts/ensure-rootless-net.sh --repair && podman compose up -d
+  ```
+  `scripts/start-stack.sh` проверяет это сам (пре-флайт), а
+  `scripts/watchdog.sh` — каждые 5 минут.
 - **`host.containers.internal` не резолвится.** Убедитесь, что у сервиса есть
   `extra_hosts: ["host.containers.internal:host-gateway"]`.
 - **После пересоздания сервиса UI отдаёт 502.** `gateway` кэширует IP под-сервисов.
