@@ -102,7 +102,32 @@ running() {
     "$PODMAN" ps --format '{{.Names}}' 2>/dev/null | grep -qx "$1"
 }
 
+# Порты, которые намеренно НЕ публикуются на хост (только внутри сети
+# стека): auth-service, media-service, music-service. Проверять их через
+# 127.0.0.1 на хосте бессмысленно — там их нет, и скрипт вечно считал их
+# упавшими, пересоздавая контейнеры и роняя юнит с exit 1.
+INTERNAL_PORTS=(8086 8091 8092)
+
+is_internal_port() {
+    local port=$1 p
+    for p in "${INTERNAL_PORTS[@]}"; do
+        [ "$p" = "$port" ] && return 0
+    done
+    return 1
+}
+
 http_code() {
+    local port=$1 name
+    if is_internal_port "$port"; then
+        name=${SERVICE_CONTAINER[${PORT_SERVICE[$port]}]}
+        if [ -n "$name" ] && "$PODMAN" exec "$name" \
+            wget -q -O- -T 2 "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
+            echo 200
+        else
+            echo 000
+        fi
+        return
+    fi
     curl -sS -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$1/health" 2>/dev/null || true
 }
 

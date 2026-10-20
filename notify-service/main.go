@@ -94,7 +94,11 @@ func main() {
 
 	serverErr := make(chan error, 1)
 	go func() {
-		addr := platform.GetEnv("NOTIFY_BIND", ":8083")
+		// ВАЖНО: слушаем все интерфейсы намеренно. Контейнеры стека ходят сюда
+		// через host.containers.internal:8083 (см. NOTIFY_SERVICE_URL в
+		// docker-compose.yml), поэтому 127.0.0.1 сломал бы доставку уведомлений.
+		// Не менять на loopback без перевода потребителей на unix-сокет/сеть.
+		addr := platform.GetEnv("NOTIFY_BIND", "0.0.0.0:8083")
 		log.Printf("🌐 notify-service HTTP на %s", addr)
 		serverErr <- app.Listen(addr)
 	}()

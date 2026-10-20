@@ -6,6 +6,9 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# conmon'ы контейнеров — потомки этого юнита; при KillMode=control-group
+# systemd убивал их при остановке, оставляя контейнеры "Up" без init-процесса.
+KillMode=process
 WorkingDirectory=%h/projects/nas-stack
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/lib/docker/cli-plugins
 ExecStart=/usr/bin/bash %h/projects/nas-stack/scripts/start-stack.sh

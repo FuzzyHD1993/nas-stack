@@ -5,3 +5,10 @@ After=network-online.target
 [Service]
 Type=oneshot
 ExecStart=%h/projects/nas-stack/scripts/watchdog.sh
+# conmon'ы, поднятые watchdog'ом, должны жить дольше самого юнита:
+# при KillMode=control-group systemd убивал их SIGKILL'ом, и контейнеры
+# оставались в состоянии "Up", но без init-процесса (гнилая metadata).
+KillMode=process
+# Не обрывать прогон по дефолтному таймауту (90 с): podman restart может
+# идти дольше. 600 с с запасом на перезапуск всех контейнеров сразу.
+TimeoutStartSec=600
