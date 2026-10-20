@@ -205,6 +205,7 @@ const COMMANDS = [
     {id: 'tab-media', label: '🎬 Медиа', action: () => showTab('media')},
     {id: 'tab-photos', label: '🖼️ Фото', action: () => showTab('photos')},
     {id: 'tab-history', label: '📜 История', action: () => showTab('history')},
+    {id: 'tab-regexlab', label: '🧪 Regex Lab', action: () => showTab('regexlab')},
     {id: 'tab-settings', label: '⚙️ Настройки', action: () => showTab('settings')},
     {id: 'theme-mocha', label: '🎨 Тема: Catppuccin Mocha', action: () => changeTheme('mocha')},
     {id: 'theme-latte', label: '☀️ Тема: Catppuccin Latte', action: () => changeTheme('latte')},
@@ -1862,6 +1863,7 @@ const DEFAULT_TABS = [
     { id: 'cinema', label: '🍿 Киноафиша', visible: true },
     { id: 'photos', label: '🖼️ Фото', visible: true },
     { id: 'history', label: '📜 История', visible: true },
+    { id: 'regexlab', label: '🧪 Regex Lab', visible: true },
     { id: 'settings', label: '⚙️ Настройки', visible: true, locked: true }
 ];
 

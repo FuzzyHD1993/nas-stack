@@ -676,6 +676,7 @@ func main() {
 	youtubeURL := platform.GetEnv("YOUTUBE_SERVICE_URL", "http://localhost:8089")
 	mediaURL := platform.GetEnv("MEDIA_SERVICE_URL", "http://localhost:8091")
 	musicURL := platform.GetEnv("MUSIC_SERVICE_URL", "http://localhost:8092")
+	goregexURL := platform.GetEnv("GOREGEX_URL", "http://goregex:8088")
 	jwtSecret := []byte(platform.GetEnv("JWT_SECRET", "change-me-in-production"))
 	authEnabled, err := strconv.ParseBool(strings.TrimSpace(platform.GetEnv("AUTH_ENABLED", "false")))
 	if err != nil {
@@ -781,6 +782,7 @@ func main() {
 	app.Use("/youtube/*", requireAuth)
 	app.Use("/media/*", requireAuth)
 	app.Use("/music/*", requireAuth)
+	app.Use("/goregex/*", requireAuth)
 
 	// ADMIN_TOKEN на всё, что даёт host-exec или доступ к .env хоста.
 	// Политика одна для middleware и proxyHandler: новые mutating-ручки
@@ -800,6 +802,7 @@ func main() {
 			"youtube":   youtubeURL,
 			"media":     mediaURL,
 			"music":     musicURL,
+			"goregex":   goregexURL,
 		}
 		ctx, cancel := context.WithTimeout(c.Context(), 5*time.Second)
 		defer cancel()
@@ -885,6 +888,7 @@ func main() {
 	app.All("/youtube/*", proxyHandler(youtubeURL, "youtube"))
 	app.All("/media/*", proxyHandler(mediaURL, "media"))
 	app.All("/music/*", proxyHandler(musicURL, "music"))
+	app.All("/goregex/*", proxyHandler(goregexURL, "goregex"))
 
 	// Глобальный поиск (параллельно по всем сервисам)
 	app.Get("/search-all", func(c fiber.Ctx) error {

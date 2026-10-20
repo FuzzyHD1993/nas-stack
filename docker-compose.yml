@@ -487,6 +487,7 @@ services:
       - YOUTUBE_SERVICE_URL=http://youtube-service:8089
       - MEDIA_SERVICE_URL=http://media-service:8091
       - MUSIC_SERVICE_URL=http://music-service:8092
+      - GOREGEX_URL=http://goregex:8088
       - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
       - AUTH_ENABLED=${AUTH_ENABLED:-false}
       - NOTIFY_GATEWAY_TOKEN=${NOTIFY_GATEWAY_TOKEN:-}
@@ -518,6 +519,34 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+
+  goregex:
+    build:
+      context: /home/konstantin/projects/goregex
+      dockerfile: web/Dockerfile
+    container_name: nas-goregex
+    # 8088 внутри контейнера; на хосте 8088 уже занят search-service,
+    # поэтому наружу публикуем 8100.
+    ports:
+      - "127.0.0.1:8100:8088"
+    environment:
+      - GOREGEX_ADDR=:8088
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.5'
+    logging:
+      driver: journald
+      options:
+        tag: "{{.Name}}"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8088/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   web-dashboard:
     build:
