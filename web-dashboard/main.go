@@ -23,10 +23,10 @@ import (
 var staticFS embed.FS
 
 // passThroughAuth — копирует входящий Authorization в исходящий запрос.
-// Нужно для /api/notify/* и /api/scheduler/*: gateway проверяет по этому же
-// заголовку ADMIN_TOKEN (host-exec ручки /notify/update/*, /notify/env*,
-// /scheduler/update/*), иначе UI получил бы 401 и не смог бы ни обновить
-// стек, ни отредактировать .env. Секреты в другие прокси не копируются.
+// Нужно для проксируемых через gateway ручек: при AUTH_ENABLED=true gateway
+// требует JWT, а для host-exec/mutating-ручек — ADMIN_TOKEN
+// (/notify/update/*, /notify/env*, /scheduler/*, /stats/cleanup/run,
+// /media/open|rename|duplicates). Иначе UI получил бы 401.
 func passThroughAuth(c fiber.Ctx, header map[string]string) map[string]string {
 	if header == nil {
 		header = map[string]string{}
@@ -122,7 +122,10 @@ func main() {
 	// ============================================================
 	app.Get("/api/status", func(c fiber.Ctx) error {
 		cc := proxyClient
-		resp, err := cc.Get(gatewayURL+"/status", client.Config{Timeout: 5 * time.Second})
+		resp, err := cc.Get(gatewayURL+"/status", client.Config{
+			Timeout: 5 * time.Second,
+			Header:  passThroughAuth(c, nil),
+		})
 		if err != nil {
 			return c.Status(502).JSON(fiber.Map{"error": "gateway недоступен"})
 		}
@@ -166,7 +169,10 @@ func main() {
 
 	app.Get("/api/auth/profiles", func(c fiber.Ctx) error {
 		cc := proxyClient
-		resp, err := cc.Get(gatewayURL+"/auth/profiles", client.Config{Timeout: 10 * time.Second})
+		resp, err := cc.Get(gatewayURL+"/auth/profiles", client.Config{
+			Timeout: 10 * time.Second,
+			Header:  passThroughAuth(c, nil),
+		})
 		if err != nil {
 			return c.Status(502).JSON(fiber.Map{"error": err.Error()})
 		}
@@ -176,7 +182,9 @@ func main() {
 	app.Post("/api/auth/profiles", func(c fiber.Ctx) error {
 		cc := proxyClient
 		resp, err := cc.Post(gatewayURL+"/auth/profiles", client.Config{
-			Timeout: 10 * time.Second, Header: map[string]string{"Content-Type": "application/json"}, Body: c.Body(),
+			Timeout: 10 * time.Second,
+			Header:  passThroughAuth(c, map[string]string{"Content-Type": "application/json"}),
+			Body:    c.Body(),
 		})
 		if err != nil {
 			return c.Status(502).JSON(fiber.Map{"error": err.Error()})
@@ -187,7 +195,9 @@ func main() {
 	app.Post("/api/auth/profiles/:id/select", func(c fiber.Ctx) error {
 		cc := proxyClient
 		resp, err := cc.Post(gatewayURL+"/auth/profiles/"+c.Params("id")+"/select", client.Config{
-			Timeout: 10 * time.Second, Header: map[string]string{"Content-Type": "application/json"}, Body: c.Body(),
+			Timeout: 10 * time.Second,
+			Header:  passThroughAuth(c, map[string]string{"Content-Type": "application/json"}),
+			Body:    c.Body(),
 		})
 		if err != nil {
 			return c.Status(502).JSON(fiber.Map{"error": err.Error()})
@@ -197,7 +207,10 @@ func main() {
 	})
 	app.Get("/api/stats", func(c fiber.Ctx) error {
 		cc := proxyClient
-		resp, err := cc.Get(gatewayURL+"/stats/all", client.Config{Timeout: 5 * time.Second})
+		resp, err := cc.Get(gatewayURL+"/stats/all", client.Config{
+			Timeout: 5 * time.Second,
+			Header:  passThroughAuth(c, nil),
+		})
 		if err != nil {
 			return c.Status(502).JSON(fiber.Map{"error": "stats недоступен"})
 		}
@@ -207,7 +220,10 @@ func main() {
 
 	app.Get("/api/stats/*", func(c fiber.Ctx) error {
 		cc := proxyClient
-		resp, err := cc.Get(gatewayURL+"/stats/"+c.Params("*"), client.Config{Timeout: 30 * time.Second})
+		resp, err := cc.Get(gatewayURL+"/stats/"+c.Params("*"), client.Config{
+			Timeout: 30 * time.Second,
+			Header:  passThroughAuth(c, nil),
+		})
 		if err != nil {
 			return c.Status(502).JSON(fiber.Map{"error": "stats недоступен"})
 		}
@@ -224,7 +240,7 @@ func main() {
 		cc := proxyClient
 		resp, err := cc.Post(target, client.Config{
 			Timeout: 120 * time.Second,
-			Header:  map[string]string{"Content-Type": "application/json"},
+			Header:  passThroughAuth(c, map[string]string{"Content-Type": "application/json"}),
 			Body:    c.Body(),
 		})
 		if err != nil {
@@ -647,7 +663,10 @@ func main() {
 
 	app.Post("/api/media/scan", func(c fiber.Ctx) error {
 		cc := proxyClient
-		resp, err := cc.Post(gatewayURL+"/media/scan", client.Config{Timeout: 120 * time.Second})
+		resp, err := cc.Post(gatewayURL+"/media/scan", client.Config{
+			Timeout: 120 * time.Second,
+			Header:  passThroughAuth(c, nil),
+		})
 		if err != nil {
 			return c.Status(502).JSON(fiber.Map{"error": err.Error()})
 		}
@@ -657,7 +676,10 @@ func main() {
 
 	app.Post("/api/media/open/:id", func(c fiber.Ctx) error {
 		cc := proxyClient
-		resp, err := cc.Post(gatewayURL+"/media/open/"+c.Params("id"), client.Config{Timeout: 10 * time.Second})
+		resp, err := cc.Post(gatewayURL+"/media/open/"+c.Params("id"), client.Config{
+			Timeout: 10 * time.Second,
+			Header:  passThroughAuth(c, nil),
+		})
 		if err != nil {
 			return c.Status(502).JSON(fiber.Map{"error": err.Error()})
 		}
@@ -761,7 +783,10 @@ func main() {
 
 	app.Post("/api/media/episode/:id/open", func(c fiber.Ctx) error {
 		cc := proxyClient
-		resp, err := cc.Post(gatewayURL+"/media/episode/"+c.Params("id")+"/open", client.Config{Timeout: 10 * time.Second})
+		resp, err := cc.Post(gatewayURL+"/media/episode/"+c.Params("id")+"/open", client.Config{
+			Timeout: 10 * time.Second,
+			Header:  passThroughAuth(c, nil),
+		})
 		if err != nil {
 			return c.Status(502).JSON(fiber.Map{"error": err.Error()})
 		}
@@ -882,7 +907,10 @@ func main() {
 			target += "?" + qs
 		}
 		cc := proxyClient
-		resp, err := cc.Get(target, client.Config{Timeout: 60 * time.Second})
+		resp, err := cc.Get(target, client.Config{
+			Timeout: 60 * time.Second,
+			Header:  passThroughAuth(c, nil),
+		})
 		if err != nil {
 			return c.Status(502).JSON(fiber.Map{"error": err.Error()})
 		}
@@ -996,7 +1024,7 @@ func main() {
 		cc := proxyClient
 		resp, err := cc.Post(gatewayURL+"/media/"+c.Params("*"), client.Config{
 			Timeout: 120 * time.Second,
-			Header:  map[string]string{"Content-Type": "application/json"},
+			Header:  passThroughAuth(c, map[string]string{"Content-Type": "application/json"}),
 			Body:    c.Body(),
 		})
 		if err != nil {
@@ -1009,7 +1037,10 @@ func main() {
 	// DELETE-прокси медиа: wishlist/:id и прочее.
 	app.Delete("/api/media/*", func(c fiber.Ctx) error {
 		cc := proxyClient
-		resp, err := cc.Delete(gatewayURL+"/media/"+c.Params("*"), client.Config{Timeout: 30 * time.Second})
+		resp, err := cc.Delete(gatewayURL+"/media/"+c.Params("*"), client.Config{
+			Timeout: 30 * time.Second,
+			Header:  passThroughAuth(c, nil),
+		})
 		if err != nil {
 			return c.Status(502).JSON(fiber.Map{"error": err.Error()})
 		}
@@ -1059,6 +1090,13 @@ func main() {
 		}
 		if cc := resp.Header("Cache-Control"); cc != "" {
 			c.Set("Cache-Control", cc)
+		}
+		// Пробрасываем защитные заголовки music-service через прокси.
+		if v := resp.Header("X-Content-Type-Options"); v != "" {
+			c.Set("X-Content-Type-Options", v)
+		}
+		if v := resp.Header("Content-Disposition"); v != "" {
+			c.Set("Content-Disposition", v)
 		}
 		if loc := resp.Header("Location"); loc != "" {
 			c.Set("Location", loc)

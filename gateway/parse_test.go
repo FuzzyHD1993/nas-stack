@@ -48,6 +48,17 @@ func TestParseSmartQueryLimit(t *testing.T) {
 	}
 }
 
+// Регрессия: regex без \b вытаскивал 2010 из 20100.
+func TestParseSmartQueryIgnoresYearInsideLongNumber(t *testing.T) {
+	got := parseSmartQuery("фильм 20100 года")
+	if _, ok := got["year_from"]; ok {
+		t.Fatalf("20100 распознан как год: %#v", got)
+	}
+	if _, ok := got["year_to"]; ok {
+		t.Fatalf("20100 распознан как год: %#v", got)
+	}
+}
+
 func TestParseSmartQueryGenreDeterministic(t *testing.T) {
 	// Регрессия: обход genreMap давал случайный жанр для ввода, матчащего
 	// несколько ключей ("мелодрама" содержит и "драма", и "мелодрам").

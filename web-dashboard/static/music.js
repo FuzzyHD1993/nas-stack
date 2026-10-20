@@ -9,6 +9,40 @@ let musicAlbumsList = [];
 let musicPlaylistsList = [];
 let currentArtist = null;
 
+// escAttr — экранирование значения для data-атрибута. escapeHtml тоже
+// экранирует кавычки, но падает на не-строках (числовые id/pos).
+function escAttr(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, ch => (
+        { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]
+    ));
+}
+
+// Один делегированный обработчик вместо inline-onclick со склейкой данных:
+// тег вида x" onmouseover=... больше не может выйти из атрибута.
+document.addEventListener('click', (ev) => {
+    const el = ev.target.closest('[data-music-action]');
+    if (!el) return;
+    const d = el.dataset;
+    switch (d.musicAction) {
+        case 'open-artist':          openArtist(d.artist); break;
+        case 'open-album':           openAlbum(d.artist, d.album); break;
+        case 'play-album':           playAlbumBulk(d.artist, d.album); break;
+        case 'play-saved-playlist':  playSavedPlaylistSidebar(d.playlist); break;
+        case 'play-artist':          playArtist(d.artist); break;
+        case 'enqueue-artist':       enqueueArtist(d.artist); break;
+        case 'play-file':            musicPlayFile(d.file); break;
+        case 'play-playlist-file':   musicPlayPlaylistFile(d.file); break;
+        case 'add-to-playlist':      openAddToPlaylist(d.file); break;
+        case 'add-to-playlist-name': addToPlaylist(d.playlist); break;
+        case 'show-playlist':        musicShowPlaylist(d.playlist); break;
+        case 'play-playlist':        musicPlayPlaylist(d.playlist); break;
+        case 'delete-playlist':      musicDeletePlaylist(d.playlist); break;
+        case 'queue-play':           musicQueuePlay(d.id); break;
+        case 'queue-delete':         musicQueueDelete(d.id); break;
+        case 'remove-favorite':      removeFavorite(d.file); break;
+    }
+});
+
 async function loadMusicSidebar() {
     const list = document.getElementById('music-sidebar-list');
     if (!list) return;
@@ -46,33 +80,37 @@ function renderMusicSidebar() {
     if (musicSidebarTab === 'artists') {
         const items = musicArtists.filter(a => !q || (a.name || '').toLowerCase().includes(q));
         html = items.map(a =>
-            '<div class="music-list-item' + (currentArtist === a.name ? ' active' : '') + '" onclick="openArtist(\'' + (a.name || '').replace(/'/g, "\\'") + '\')">' +
+            '<div class="music-list-item' + (currentArtist === a.name ? ' active' : '') + '"' +
+            ' data-music-action="open-artist" data-artist="' + escAttr(a.name) + '">' +
             '<span>👤 ' + escapeHtml(a.name) + '</span><span class="badge">' + (a.track_count || 0) + '</span></div>'
         ).join('');
     } else if (musicSidebarTab === 'albums') {
         const items = musicAlbumsList.filter(a => !q ||
             (a.album || '').toLowerCase().includes(q) || (a.artist || '').toLowerCase().includes(q));
         html = items.map(a =>
-            '<div class="music-list-item" onclick="openAlbum(\'' + (a.artist || '').replace(/'/g, "\\'") + '\',\'' + (a.album || '').replace(/'/g, "\\'") + '\')">' +
+            '<div class="music-list-item" data-music-action="open-album"' +
+            ' data-artist="' + escAttr(a.artist) + '" data-album="' + escAttr(a.album) + '">' +
             '<span>💿 ' + escapeHtml(a.artist || '') + ' — ' + escapeHtml(a.album || '') + '</span></div>'
         ).join('');
     } else {
         const items = musicPlaylistsList.filter(p => !q || ((p.name || p) + '').toLowerCase().includes(q));
         html = items.map(p => {
             const name = p.name || p;
-            return '<div class="music-list-item" onclick="playSavedPlaylistSidebar(\'' + (name + '').replace(/'/g, "\\'") + '\')"><span>📋 ' + escapeHtml(name) + '</span></div>';
+            return '<div class="music-list-item" data-music-action="play-saved-playlist" data-playlist="' + escAttr(name) + '">' +
+                '<span>📋 ' + escapeHtml(name) + '</span></div>';
         }).join('');
     }
     list.innerHTML = html || '<div class="empty">Ничего не найдено</div>';
 }
 
 function renderTrackRow(t) {
-    const f = (t.file || t.path || '').replace(/'/g, "\\'");
     const file = t.file || t.path || '';
     const title = t.title || file.split('/').pop();
     const playing = currentPlayingFile && file === currentPlayingFile ? ' playing' : '';
-    return '<div class="track-row' + playing + '" onclick="musicPlayFile(\'' + f + '\')">' +
-        '<button class="track-add-pl" onclick="event.stopPropagation();openAddToPlaylist(\'' + encodeURIComponent(file) + '\')">➕</button>' +
+    return '<div class="track-row' + playing + '" data-music-action="play-file"' +
+        ' data-file="' + escAttr(file) + '">' +
+        '<button class="track-add-pl" data-music-action="add-to-playlist"' +
+        ' data-file="' + escAttr(file) + '" title="Добавить в плейлист">➕</button>' +
         '<span class="track-title">' + escapeHtml(title) + '</span>' +
         '<span class="track-duration">' + fmtMusicTime(t.duration || 0) + '</span></div>';
 }
@@ -98,12 +136,12 @@ async function openArtist(name) {
     let d;
     try { d = await (await apiFetch('/api/music/artist/' + encodeURIComponent(name))).json(); }
     catch (e) { notify('❌ ' + e.message, true); return; }
-    const safe = (d.artist || name).replace(/'/g, "\\'");
-    let html = '<div class="artist-header"><h2>👤 ' + escapeHtml(d.artist || name) + '</h2>' +
+    const shown = d.artist || name;
+    let html = '<div class="artist-header"><h2>👤 ' + escapeHtml(shown) + '</h2>' +
         '<div class="artist-stats">' + (d.track_count || 0) + ' треков · ' + (d.album_count || 0) + ' альбомов</div>' +
         '<div class="artist-actions">' +
-        '<button onclick="playArtist(\'' + safe + '\')">▶️ Играть всё</button>' +
-        '<button onclick="enqueueArtist(\'' + safe + '\')">➕ В очередь</button>' +
+        '<button data-music-action="play-artist" data-artist="' + escAttr(shown) + '">▶️ Играть всё</button>' +
+        '<button data-music-action="enqueue-artist" data-artist="' + escAttr(shown) + '">➕ В очередь</button>' +
         '</div></div><div class="artist-albums">';
     const albums = d.albums || {};
     for (const [alb, tracks] of Object.entries(albums)) {
@@ -122,11 +160,11 @@ async function openAlbum(artist, album) {
     let d;
     try { d = await (await apiFetch('/api/music/albums/' + encodeURIComponent(artist) + '/' + encodeURIComponent(album))).json(); }
     catch (e) { notify('❌ ' + e.message, true); return; }
-    const a1 = artist.replace(/'/g, "\\'"), a2 = album.replace(/'/g, "\\'");
+    const a1 = escAttr(artist), a2 = escAttr(album);
     let html = '<div class="album-header"><h2>💿 ' + escapeHtml(cleanMetaName(album) || album) + '</h2>' +
         '<div class="artist-stats">' + escapeHtml(artist) + '</div>' +
         '<div class="album-actions">' +
-        '<button onclick="playAlbumBulk(\'' + a1 + '\',\'' + a2 + '\')">▶️ Играть</button>' +
+        '<button data-music-action="play-album" data-artist="' + a1 + '" data-album="' + a2 + '">▶️ Играть</button>' +
         '</div></div><div class="track-list">' +
         (d.tracks || []).map(renderTrackRow).join('') + '</div>';
     showMusicDetail(html);
@@ -363,7 +401,7 @@ async function onSeekCommit(value) {
     await musicSeek(pos);
     window._seeking = false;
 }
-function fpAddToPlaylist() { if (window._cur && window._cur.file) openAddToPlaylist(encodeURIComponent(window._cur.file)); }
+function fpAddToPlaylist() { if (window._cur && window._cur.file) openAddToPlaylist(window._cur.file); }
 async function fpAddToQueue() {
     if (!window._cur || !window._cur.file) return;
     try { await apiFetch('/api/music/queue/add', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({file: window._cur.file})}); notify('📋 Добавлено в очередь'); }
@@ -438,13 +476,13 @@ async function musicLoadPlaylists() {
         if (!list.length) { grid.innerHTML = '<div class="loading">Нет плейлистов</div>'; return; }
         let html = '';
         list.forEach(p => {
-            const safe = p.name.replace(/'/g, "\\'");
+            const safeName = escAttr(p.name);
             html += '<div class="music-album">';
-            html += '<div class="music-album-cover" style="display:flex;align-items:center;justify-content:center;font-size:40px;cursor:pointer;" onclick="musicShowPlaylist(\'' + safe + '\')">📋</div>';
+            html += '<div class="music-album-cover" style="display:flex;align-items:center;justify-content:center;font-size:40px;cursor:pointer;" data-music-action="show-playlist" data-playlist="' + safeName + '">📋</div>';
             html += '<div class="music-album-title">' + escapeHtml(p.name) + '</div>';
             html += '<div style="display:flex;gap:4px;margin-top:6px;">';
-            html += '<button onclick="musicPlayPlaylist(\'' + safe + '\')" style="flex:1;font-size:11px;">▶️ Играть</button>';
-            html += '<button class="danger" onclick="musicDeletePlaylist(\'' + safe + '\')" style="font-size:11px;">🗑️</button>';
+            html += '<button data-music-action="play-playlist" data-playlist="' + safeName + '" style="flex:1;font-size:11px;">▶️ Играть</button>';
+            html += '<button class="danger" data-music-action="delete-playlist" data-playlist="' + safeName + '" style="font-size:11px;">🗑️</button>';
             html += '</div></div>';
         });
         grid.innerHTML = html;
@@ -463,8 +501,8 @@ async function musicShowPlaylist(name) {
         if (!tracks.length) { html += '<div class="loading">Пусто</div>'; box.innerHTML = html; return; }
         html += '<div class="album-tracks">';
         tracks.forEach((t, i) => {
-            const file = (t.file || '').replace(/'/g, "\\'");
-            html += '<div class="album-track" onclick="musicPlayPlaylistFile(\'' + file + '\')">';
+            const file = t.file || '';
+            html += '<div class="album-track" data-music-action="play-playlist-file" data-file="' + escAttr(file) + '">';
             html += '<span class="track-num">' + (i + 1) + '</span>';
             html += '<span class="track-title">' + escapeHtml(t.title || t.file || '') + '</span>';
             html += '<span class="track-duration">' + fmtMusicTime(t.duration || 0) + '</span>';
@@ -536,10 +574,10 @@ async function musicLoadQueue() {
         tracks.forEach((t, i) => {
             const id = t.id || t.pos || '';
             html += '<div class="album-track">';
-            html += '<span class="track-num" onclick="musicQueuePlay(\'' + id + '\')" style="cursor:pointer;">' + (i + 1) + '</span>';
-            html += '<span class="track-title" onclick="musicQueuePlay(\'' + id + '\')" style="cursor:pointer;flex:1;">' + escapeHtml(t.title || t.file || '') + '</span>';
+            html += '<span class="track-num" data-music-action="queue-play" data-id="' + escAttr(id) + '" style="cursor:pointer;">' + (i + 1) + '</span>';
+            html += '<span class="track-title" data-music-action="queue-play" data-id="' + escAttr(id) + '" style="cursor:pointer;flex:1;">' + escapeHtml(t.title || t.file || '') + '</span>';
             html += '<span class="track-duration">' + fmtMusicTime(t.duration || 0) + '</span>';
-            html += '<span class="track-actions">' + addPlBtn(t.file) + '<button onclick="event.stopPropagation(); musicQueueDelete(\'' + id + '\')" style="background:transparent;border:none;color:var(--error);cursor:pointer;font-size:14px;" title="Удалить">🗑️</button></span>';
+            html += '<span class="track-actions">' + addPlBtn(t.file) + '<button data-music-action="queue-delete" data-id="' + escAttr(id) + '" style="background:transparent;border:none;color:var(--error);cursor:pointer;font-size:14px;" title="Удалить">🗑️</button></span>';
             html += '</div>';
         });
         list.innerHTML = html;
@@ -571,10 +609,10 @@ async function musicQueueClear() {
 let pendingTrackFile = null;
 function addPlBtn(file) {
     if (!file) return '';
-    return '<button class="track-add-pl" onclick="event.stopPropagation(); openAddToPlaylist(\'' + encodeURIComponent(file) + '\')" title="Добавить в плейлист">➕</button>';
+    return '<button class="track-add-pl" data-music-action="add-to-playlist" data-file="' + escAttr(file) + '" title="Добавить в плейлист">➕</button>';
 }
-async function openAddToPlaylist(encodedFile) {
-    pendingTrackFile = decodeURIComponent(encodedFile);
+async function openAddToPlaylist(file) {
+    pendingTrackFile = file;
     document.getElementById('add-pl-current-track').textContent = '📁 ' + pendingTrackFile.split('/').pop();
     const listEl = document.getElementById('playlists-list');
     listEl.innerHTML = '<div class="loading">Загрузка...</div>';
@@ -585,7 +623,7 @@ async function openAddToPlaylist(encodedFile) {
         let html = '';
         (data.playlists || []).forEach(p => {
             const name = p.name || p;
-            html += '<div class="playlist-option" onclick="addToPlaylist(\'' + encodeURIComponent(name) + '\')">📋 ' + escapeHtml(name) + '</div>';
+            html += '<div class="playlist-option" data-music-action="add-to-playlist-name" data-playlist="' + escAttr(name) + '">📋 ' + escapeHtml(name) + '</div>';
         });
         if (!html) html = '<div style="color:var(--fg-dim);">Нет плейлистов. Создайте первый выше.</div>';
         listEl.innerHTML = html;
@@ -595,9 +633,8 @@ function closeAddToPlaylist() {
     document.getElementById('add-to-playlist-modal').classList.remove('show');
     pendingTrackFile = null;
 }
-async function addToPlaylist(encodedName) {
+async function addToPlaylist(name) {
     if (!pendingTrackFile) return;
-    const name = decodeURIComponent(encodedName);
     try {
         const r = await apiFetch('/api/music/saved-playlists/' + encodeURIComponent(name) + '/tracks', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -779,8 +816,8 @@ async function musicShowSimilar() {
         if (!tracks.length) { document.getElementById('similar-body').innerHTML = '<div class="loading">Нет похожих</div>'; return; }
         let html = '';
         tracks.forEach(t => {
-            const f = (t.file || '').replace(/'/g, "\\'");
-            html += '<div class="album-track" onclick="musicPlayFile(\'' + f + '\')"><span class="track-title">' + escapeHtml(t.title || t.file || '') + '</span><span class="track-duration">' + escapeHtml(t.artist || '') + '</span><span class="track-actions">' + addPlBtn(t.file) + '</span></div>';
+            const f = t.file || '';
+            html += '<div class="album-track" data-music-action="play-file" data-file="' + escAttr(f) + '"><span class="track-title">' + escapeHtml(t.title || t.file || '') + '</span><span class="track-duration">' + escapeHtml(t.artist || '') + '</span><span class="track-actions">' + addPlBtn(t.file) + '</span></div>';
         });
         document.getElementById('similar-body').innerHTML = html;
     } catch (e) { document.getElementById('similar-body').innerHTML = '<div class="error">Ошибка: ' + e.message + '</div>'; }
@@ -827,8 +864,8 @@ async function loadFavorites() {
         if (!items.length) { el.innerHTML = '<div class="loading">Нет избранного</div>'; return; }
         let html = '<div class="album-tracks">';
         items.forEach(f => {
-            const fp = (f.file_path || '').replace(/'/g, "\\'");
-            html += '<div class="album-track" onclick="musicPlayFile(\'' + fp + '\')"><span class="track-title">' + escapeHtml((f.artist||'') + ' — ' + (f.title||'')) + '</span><span class="track-actions">' + addPlBtn(f.file_path) + '<button onclick="event.stopPropagation(); removeFavorite(\'' + fp + '\')" style="background:transparent;border:none;color:var(--error);cursor:pointer;">🗑️</button></span></div>';
+            const fp = f.file_path || '';
+            html += '<div class="album-track" data-music-action="play-file" data-file="' + escAttr(fp) + '"><span class="track-title">' + escapeHtml((f.artist||'') + ' — ' + (f.title||'')) + '</span><span class="track-actions">' + addPlBtn(f.file_path) + '<button data-music-action="remove-favorite" data-file="' + escAttr(fp) + '" style="background:transparent;border:none;color:var(--error);cursor:pointer;">🗑️</button></span></div>';
         });
         html += '</div>';
         el.innerHTML = html;
@@ -862,8 +899,7 @@ async function loadRecentMusic() {
             const title = p.title || base.replace(/\.[^.]+$/, '') || 'Без названия';
             const artist = p.artist || 'Неизвестный';
             const album = p.album || '';
-            const safe = file.replace(/'/g, "\\'");
-            html += '<div class="listen-row" onclick="musicPlayFile(\'' + safe + '\')">' +
+            html += '<div class="listen-row" data-music-action="play-file" data-file="' + escAttr(file) + '">' +
                 '<span class="listen-artist">' + escapeHtml(artist) + '</span>' +
                 '<span class="listen-title">' + escapeHtml(title) + '</span>' +
                 (album ? '<span class="listen-album">' + escapeHtml(album) + '</span>' : '') +
@@ -889,9 +925,9 @@ async function refreshListensCount() {
 async function clearListens() {
     if (!confirm('Очистить историю прослушиваний?')) return;
     try {
-        const r = await apiFetch('/api/music/listens', {method: 'DELETE'});
+        const r = await adminFetch('/api/music/listens?confirm=yes', {method: 'DELETE'});
         if (r.ok) { notify('🗑 История очищена'); loadRecentMusic(); }
-        else notify('❌ Не удалось очистить', true);
+        else notify('❌ Не удалось очистить (нужен ADMIN_TOKEN)', true);
     } catch (e) { notify('❌ ' + e.message, true); }
 }
 

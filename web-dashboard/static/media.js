@@ -125,7 +125,7 @@ async function scanMedia(event) {
     btn.disabled = true;
     btn.textContent = '🔄 Сканирование...';
     try {
-        const r = await fetch('/api/media/scan', {method: 'POST'});
+        const r = await adminFetch('/api/media/scan', {method: 'POST'});
         const d = await r.json();
         if (d.status === 'already_running') {
             notify('📚 Сканирование уже идёт');
@@ -467,7 +467,7 @@ async function playEpisode(id) {
 
 async function openEpisodeInVlc(id) {
     try {
-        const r = await fetch('/api/media/episode/' + id + '/open', {method: 'POST'});
+        const r = await adminFetch('/api/media/episode/' + id + '/open', {method: 'POST'});
         const d = await r.json();
         if (d.error) notify('❌ ' + d.error, true);
     } catch (e) {
@@ -510,7 +510,7 @@ async function renamePreview() {
         if (d.exists) msg += '\n\n⚠️ Целевой путь уже существует!';
         if (d.episodes && d.episodes.length) msg += '\n\nЭпизодов: ' + d.episodes.length;
         if (!confirm(msg + '\n\nПрименить переименование?')) return;
-        const ar = await fetch('/api/media/rename/apply', {
+        const ar = await adminFetch('/api/media/rename/apply', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({id: currentMediaId})
@@ -639,7 +639,7 @@ async function matchMediaToTmdb(tmdbId) {
 async function openMediaItem() {
     if (!currentMediaId) return;
     try {
-        const r = await fetch('/api/media/open/' + currentMediaId, {method: 'POST'});
+        const r = await adminFetch('/api/media/open/' + currentMediaId, {method: 'POST'});
         const d = await r.json();
         if (d.error) notify('❌ ' + d.error, true);
     } catch (e) {

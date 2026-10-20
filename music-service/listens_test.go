@@ -1,19 +1,34 @@
 package main
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 func TestParseFloat(t *testing.T) {
-	cases := map[string]float64{
-		"12.5": 12.5,
-		"0":    0,
-		" 7 ":  7,
-		"bad":  0,
-		"":     0,
+	cases := []struct {
+		name string
+		in   string
+		want float64
+	}{
+		{"decimal", "12.5", 12.5},
+		{"zero", "0", 0},
+		{"spaces", " 7 ", 7},
+		{"garbage", "bad", 0},
+		{"empty", "", 0},
+		{"nan", "NaN", 0},
+		{"inf", "Inf", 0},
+		{"neg_inf", "-Inf", 0},
+		{"overflow", "1e400", 0},
+		{"negative", "-1", 0},
+		{"too_long", "99999999", 0},
 	}
-	for in, want := range cases {
-		if got := parseFloat(in); got != want {
-			t.Errorf("parseFloat(%q) = %v, want %v", in, got, want)
-		}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseFloat(tc.in); math.Abs(got-tc.want) > 1e-9 {
+				t.Fatalf("parseFloat(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -37,5 +52,30 @@ func TestTrackMap(t *testing.T) {
 	m2 := trackMap("x.flac", "A", "B", "Real Title")
 	if m2["title"] != "Real Title" {
 		t.Errorf("title = %v, want Real Title", m2["title"])
+	}
+}
+
+func TestIsIgnoredTrack(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"Artist/Testament/01.flac", false},
+		{"Artist/Greatest Hits/01.flac", false},
+		{"Artist/Contest/01.flac", false},
+		{"Artist/Sampler/01.flac", false},
+		{"Artist/Samples/01.flac", true},
+		{"test_foo/01.flac", true},
+		{"Artist/Album/sample_01.flac", true},
+		{"test.flac", true},
+		{"preview.mp3", true},
+		{"Artist/Album/01.flac", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			if got := isIgnoredTrack(tc.in); got != tc.want {
+				t.Fatalf("isIgnoredTrack(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
 	}
 }

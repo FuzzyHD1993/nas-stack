@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,6 +25,8 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/middleware/adaptor"
+	fiberrecover "github.com/gofiber/fiber/v3/middleware/recover"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
@@ -104,7 +108,10 @@ type personRef struct {
 	Character  string `json:"character,omitempty"`
 }
 
-const mediaCols = `id, media_type, title, original_title, year, tmdb_id, overview, poster_url, backdrop_url, rating, genres, runtime`
+const mediaCols = `id, media_type, title,
+	COALESCE(original_title,''), COALESCE(year,0), COALESCE(tmdb_id,0),
+	COALESCE(overview,''), COALESCE(poster_url,''), COALESCE(backdrop_url,''),
+	COALESCE(rating,0), COALESCE(genres,''), COALESCE(runtime,0)`
 
 // Расширения для фото-галереи.
 var photoImageExts = map[string]bool{
@@ -117,22 +124,179 @@ var photoVideoExts = map[string]bool{
 }
 
 // photoAbsPath превращает относительный путь в абсолютный внутри MEDIA_PHOTOS_DIR,
-// защищаясь от выхода за пределы каталога.
+// защищаясь от выхода за пределы каталога (включая симлинки).
 func photoAbsPath(rel string) (string, bool) {
 	dir := platform.GetEnv("MEDIA_PHOTOS_DIR", "/photos")
-	root := filepath.Clean(dir)
+	root, err := filepath.Abs(filepath.Clean(dir))
+	if err != nil {
+		return "", false
+	}
+
 	clean := filepath.Clean(filepath.Join(root, rel))
 	if clean != root && !strings.HasPrefix(clean, root+string(os.PathSeparator)) {
 		return "", false
 	}
-	return clean, true
+
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", false
+	}
+	real, err := filepath.EvalSymlinks(clean)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return clean, true // пусть обработчик вернёт 404
+		}
+		return "", false
+	}
+	if real != realRoot && !strings.HasPrefix(real, realRoot+string(os.PathSeparator)) {
+		return "", false
+	}
+	return real, true
+}
+
+// libraryRoot — корень библиотеки для данного типа медиа.
+func libraryRoot(mediaType string) string {
+	if mediaType == "tv" {
+		return platform.GetEnv("MEDIA_TV_DIR", "/tv")
+	}
+	return platform.GetEnv("MEDIA_MOVIES_DIR", "/movies")
+}
+
+// withinRoot проверяет, что p — строго внутри root (не сам root и не "..").
+func withinRoot(root, p string) bool {
+	root = filepath.Clean(root)
+	p = filepath.Clean(p)
+	if root == "" || p == "" || p == "." {
+		return false
+	}
+	rel, err := filepath.Rel(root, p)
+	if err != nil {
+		return false
+	}
+	if rel == "." || rel == ".." || filepath.IsAbs(rel) {
+		return false
+	}
+	return !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+}
+
+// mediaFilePath проверяет, что путь из БД лежит внутри библиотеки, является
+// обычным файлом и после раскрытия симлинков не выходит за её пределы.
+func mediaFilePath(p, mediaType string) (string, error) {
+	root := libraryRoot(mediaType)
+	if !withinRoot(root, p) {
+		return "", fmt.Errorf("path outside library")
+	}
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", err
+	}
+	real, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		return "", err
+	}
+	if !withinRoot(realRoot, real) {
+		return "", fmt.Errorf("path outside library")
+	}
+	fi, err := os.Stat(real)
+	if err != nil {
+		return "", err
+	}
+	if !fi.Mode().IsRegular() {
+		return "", fmt.Errorf("not a regular file")
+	}
+	return real, nil
+}
+
+func imageMime(ext string) string {
+	switch ext {
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".png":
+		return "image/png"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".avif":
+		return "image/avif"
+	case ".bmp":
+		return "image/bmp"
+	case ".heic":
+		return "image/heic"
+	case ".heif":
+		return "image/heif"
+	}
+	return "application/octet-stream"
+}
+
+func safeImageContentType(ct string) string {
+	ct = strings.ToLower(strings.TrimSpace(strings.SplitN(ct, ";", 2)[0]))
+	switch ct {
+	case "image/jpeg", "image/png", "image/webp", "image/gif", "image/avif":
+		return ct
+	}
+	return ""
+}
+
+var posterHTTPClient = &http.Client{
+	Timeout: 15 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
+func posterURLAllowed(raw string) (*url.URL, bool) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.Host != "image.tmdb.org" || u.User != nil {
+		return nil, false
+	}
+	if !strings.HasPrefix(u.Path, "/t/p/") {
+		return nil, false
+	}
+	return u, true
+}
+
+// mediaAdminOK — defense in depth: media-service опубликован на 8091, поэтому
+// деструктивные ручки нельзя оставлять только на проверке gateway.
+func mediaAdminOK(c fiber.Ctx) bool {
+	expected := strings.TrimSpace(platform.GetEnv("ADMIN_TOKEN", ""))
+	if expected == "" {
+		return false
+	}
+
+	candidates := []string{strings.TrimSpace(c.Get("X-Admin-Token"))}
+	auth := strings.TrimSpace(c.Get("Authorization"))
+	if len(auth) >= 7 && strings.EqualFold(auth[:7], "Bearer ") {
+		candidates = append(candidates, strings.TrimSpace(auth[7:]))
+	}
+
+	want := sha256.Sum256([]byte(expected))
+	for _, got := range candidates {
+		if got == "" {
+			continue
+		}
+		h := sha256.Sum256([]byte(got))
+		if subtle.ConstantTimeCompare(h[:], want[:]) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+func requireMediaAdmin(c fiber.Ctx) error {
+	if mediaAdminOK(c) {
+		return c.Next()
+	}
+	return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "admin token required"})
 }
 
 func main() {
 	if err := platform.ValidateEnv([]string{"TMDB_API_KEY", "POSTGRES_URL"}); err != nil {
 		log.Fatalf("❌ %v", err)
 	}
-	initPhotoCache()
+	if err := initPhotoCache(); err != nil {
+		log.Fatalf("❌ photo cache: %v", err)
+	}
 	pgURL := platform.GetEnv("POSTGRES_URL", "postgres://nas:nas_secret@localhost:5432/nas_history?sslmode=disable")
 	var err error
 	db, err = pgxpool.New(ctx, pgURL)
@@ -154,35 +318,40 @@ func main() {
 
 	app := fiber.New()
 	platform.StartPprof()
+	app.Use(fiberrecover.New())
 	app.Use(metricsMiddleware())
 
 	app.Get("/metrics", adaptor.HTTPHandler(promhttp.Handler()))
 
 	app.Get("/health", func(c fiber.Ctx) error {
-		if err := db.Ping(ctx); err != nil {
-			return c.Status(500).JSON(fiber.Map{"status": "error", "db": err.Error()})
+		pingCtx, cancel := context.WithTimeout(c.Context(), 2*time.Second)
+		defer cancel()
+		if err := db.Ping(pingCtx); err != nil {
+			log.Printf("health: db ping: %v", err)
+			return c.Status(500).JSON(fiber.Map{"status": "error"})
 		}
 		return c.JSON(platform.HealthJSON("media", nil))
 	})
 
 	// Сканировать библиотеку (фоново)
-	app.Post("/scan", func(c fiber.Ctx) error {
-		ok, err := rdb.SetNX(ctx, "media:scan:running", "true", 10*time.Minute).Result()
+	app.Post("/scan", requireMediaAdmin, func(c fiber.Ctx) error {
+		token, ok, err := acquireScanLock()
 		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+			log.Printf("scan lock: %v", err)
+			return c.Status(500).JSON(fiber.Map{"error": "internal error"})
 		}
 		if !ok {
 			return c.JSON(fiber.Map{"status": "already_running"})
 		}
-		_ = rdb.Set(ctx, "media:scan:progress", "0", 10*time.Minute).Err()
-		_ = rdb.Set(ctx, "media:scan:total", "0", 10*time.Minute).Err()
-		go runScan()
+		_ = rdb.Set(ctx, "media:scan:progress", "0", scanLockTTL).Err()
+		_ = rdb.Set(ctx, "media:scan:total", "0", scanLockTTL).Err()
+		go runScan(token)
 		return c.JSON(fiber.Map{"status": "started"})
 	})
 
 	// Статус сканирования
 	app.Get("/scan/status", func(c fiber.Ctx) error {
-		running := rdb.Get(ctx, "media:scan:running").Val() == "true"
+		running := rdb.Exists(ctx, scanLockKey).Val() == 1
 		progress, _ := strconv.Atoi(rdb.Get(ctx, "media:scan:progress").Val())
 		total, _ := strconv.Atoi(rdb.Get(ctx, "media:scan:total").Val())
 		last := rdb.Get(ctx, "media:scan:last").Val()
@@ -194,7 +363,7 @@ func main() {
 	})
 
 	// Дозагрузка актёров/режиссёров для уже просканированных медиа
-	app.Post("/scan/credits", func(c fiber.Ctx) error {
+	app.Post("/scan/credits", requireMediaAdmin, func(c fiber.Ctx) error {
 		ok, err := rdb.SetNX(ctx, "media:credits:running", "true", 30*time.Minute).Result()
 		if err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
@@ -308,7 +477,7 @@ func main() {
 		return c.JSON(fiber.Map{"duplicates": dupes, "count": len(dupes)})
 	})
 
-	app.Post("/duplicates/resolve", func(c fiber.Ctx) error {
+	app.Post("/duplicates/resolve", requireMediaAdmin, func(c fiber.Ctx) error {
 		var req struct {
 			TmdbID    int   `json:"tmdb_id"`
 			KeepID    int   `json:"keep_id"`
@@ -317,64 +486,131 @@ func main() {
 		if err := c.Bind().JSON(&req); err != nil {
 			return c.Status(400).JSON(fiber.Map{"error": "bad json"})
 		}
-		agentURL := platform.GetEnv("HOST_AGENT_URL", "http://host.containers.internal:9998")
-		hostPaths := []string{}
-		deleteSet := map[int]bool{}
+		if req.TmdbID <= 0 || req.KeepID <= 0 || len(req.DeleteIDs) == 0 || len(req.DeleteIDs) > 50 {
+			return c.Status(400).JSON(fiber.Map{"error": "tmdb_id, keep_id and 1..50 delete_ids are required"})
+		}
+
+		seen := map[int]bool{}
+		ids := make([]int32, 0, len(req.DeleteIDs))
 		for _, id := range req.DeleteIDs {
-			if id == req.KeepID {
-				return c.Status(400).JSON(fiber.Map{"error": "cannot delete keep_id"})
+			if id <= 0 || id == req.KeepID || seen[id] {
+				continue
 			}
-			var p, mt string
-			if db.QueryRow(ctx, `SELECT COALESCE(path,''), media_type FROM media WHERE id=$1`, id).Scan(&p, &mt) == nil && p != "" {
-				hostPaths = append(hostPaths, toHostPath(p, mt))
-				deleteSet[id] = true
-			}
+			seen[id] = true
+			ids = append(ids, int32(id))
 		}
-		var keepHost string
-		{
-			var p, mt string
-			if db.QueryRow(ctx, `SELECT COALESCE(path,''), media_type FROM media WHERE id=$1`, req.KeepID).Scan(&p, &mt) == nil {
-				keepHost = toHostPath(p, mt)
-			}
+		if len(ids) == 0 {
+			return c.Status(400).JSON(fiber.Map{"error": "nothing to delete"})
 		}
-		moved := []string{}
-		if len(hostPaths) > 0 {
-			body, _ := json.Marshal(fiber.Map{"paths": hostPaths, "keep": keepHost})
-			req2, _ := http.NewRequest("POST", agentURL+"/duplicates/resolve", bytes.NewReader(body))
-			req2.Header.Set("Content-Type", "application/json")
-			// host-agent защищает перенос файлов библиотеки ADMIN_TOKEN'ом.
-			if t := strings.TrimSpace(platform.GetEnv("ADMIN_TOKEN", "")); t != "" {
-				req2.Header.Set("X-Admin-Token", t)
+
+		var keepPath, keepType string
+		if err := db.QueryRow(ctx,
+			`SELECT COALESCE(path,''), media_type FROM media WHERE id=$1 AND tmdb_id=$2`,
+			req.KeepID, req.TmdbID).Scan(&keepPath, &keepType); err != nil || keepPath == "" {
+			return c.Status(404).JSON(fiber.Map{"error": "keep_id not found for tmdb_id"})
+		}
+		keepHost, err := toHostPath(keepPath, keepType)
+		if err != nil {
+			return c.Status(409).JSON(fiber.Map{"error": "keep path outside library"})
+		}
+
+		rows, err := db.Query(ctx,
+			`SELECT id, COALESCE(path,''), media_type FROM media
+			  WHERE id = ANY($1) AND tmdb_id=$2 AND id <> $3`,
+			ids, req.TmdbID, req.KeepID)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "internal error"})
+		}
+		type duplicate struct {
+			id   int
+			host string
+		}
+		dupes := []duplicate{}
+		for rows.Next() {
+			var id int
+			var p, mt string
+			if rows.Scan(&id, &p, &mt) != nil || p == "" {
+				continue
 			}
-			hc := &http.Client{Timeout: 60 * time.Second}
-			resp, err := hc.Do(req2)
+			h, err := toHostPath(p, mt)
 			if err != nil {
-				return c.Status(502).JSON(fiber.Map{"error": "host-agent: " + err.Error()})
+				rows.Close()
+				return c.Status(409).JSON(fiber.Map{"error": "duplicate path outside library"})
 			}
-			respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
-			_ = resp.Body.Close()
-			var ar struct {
-				Moved []string `json:"moved"`
-			}
-			_ = json.Unmarshal(respBody, &ar)
-			moved = ar.Moved
+			dupes = append(dupes, duplicate{id: id, host: h})
 		}
-		// Удаляем из библиотеки только те записи, чьи файлы перемещены.
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "internal error"})
+		}
+		if len(dupes) == 0 {
+			return c.Status(400).JSON(fiber.Map{"error": "delete_ids do not belong to tmdb_id"})
+		}
+
+		hostPaths := make([]string, 0, len(dupes))
+		for _, d := range dupes {
+			hostPaths = append(hostPaths, d.host)
+		}
+
+		agentURL := strings.TrimRight(platform.GetEnv("HOST_AGENT_URL", "http://host.containers.internal:9998"), "/")
+		body, _ := json.Marshal(fiber.Map{"paths": hostPaths, "keep": keepHost})
+		reqCtx, cancel := context.WithTimeout(c.Context(), 60*time.Second)
+		defer cancel()
+		req2, err := http.NewRequestWithContext(reqCtx, http.MethodPost, agentURL+"/duplicates/resolve", bytes.NewReader(body))
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "internal error"})
+		}
+		req2.Header.Set("Content-Type", "application/json")
+		if t := strings.TrimSpace(platform.GetEnv("ADMIN_TOKEN", "")); t != "" {
+			req2.Header.Set("X-Admin-Token", t)
+		}
+
+		hc := &http.Client{Timeout: 60 * time.Second}
+		resp, err := hc.Do(req2)
+		if err != nil {
+			log.Printf("duplicates/resolve: host-agent: %v", err)
+			return c.Status(502).JSON(fiber.Map{"error": "host-agent failed"})
+		}
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
+		_ = resp.Body.Close()
+		if resp.StatusCode/100 != 2 {
+			log.Printf("duplicates/resolve: host-agent status %d: %s", resp.StatusCode, string(respBody))
+			return c.Status(502).JSON(fiber.Map{"error": "host-agent failed"})
+		}
+
+		var ar struct {
+			Moved []string `json:"moved"`
+		}
+		if err := json.Unmarshal(respBody, &ar); err != nil {
+			return c.Status(502).JSON(fiber.Map{"error": "host-agent bad response"})
+		}
+		movedSet := make(map[string]bool, len(ar.Moved))
+		for _, m := range ar.Moved {
+			movedSet[filepath.Clean(m)] = true
+		}
+
+		tx, err := db.Begin(ctx)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "internal error"})
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+
 		removed := 0
-		movedSet := map[string]bool{}
-		for _, m := range moved {
-			movedSet[m] = true
-		}
-		for id := range deleteSet {
-			var p, mt string
-			_ = db.QueryRow(ctx, `SELECT COALESCE(path,''), media_type FROM media WHERE id=$1`, id).Scan(&p, &mt)
-			if movedSet[toHostPath(p, mt)] {
-				if ct, err := db.Exec(ctx, `DELETE FROM media WHERE id=$1`, id); err == nil {
-					removed += int(ct.RowsAffected())
-				}
+		for _, d := range dupes {
+			if !movedSet[filepath.Clean(d.host)] {
+				continue
 			}
+			ct, err := tx.Exec(ctx, `DELETE FROM media WHERE id=$1 AND tmdb_id=$2`, d.id, req.TmdbID)
+			if err != nil {
+				log.Printf("duplicates: delete %d: %v", d.id, err)
+				return c.Status(500).JSON(fiber.Map{"error": "internal error"})
+			}
+			removed += int(ct.RowsAffected())
 		}
-		return c.JSON(fiber.Map{"status": "resolved", "removed": removed, "moved_files": len(moved)})
+		if err := tx.Commit(ctx); err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "internal error"})
+		}
+		return c.JSON(fiber.Map{"status": "resolved", "removed": removed, "moved_files": len(ar.Moved)})
 	})
 
 	// Умный поиск фильмов по параметрам (жанр/длительность/рейтинг/год).
@@ -487,25 +723,34 @@ func main() {
 
 	// Прокси постера
 	app.Get("/poster", func(c fiber.Ctx) error {
-		p := c.Query("url")
-		if p == "" {
-			return c.Status(400).JSON(fiber.Map{"error": "url is required"})
-		}
-		if !strings.HasPrefix(p, "https://image.tmdb.org/") {
+		u, ok := posterURLAllowed(c.Query("url"))
+		if !ok {
 			return c.Status(400).JSON(fiber.Map{"error": "invalid url"})
 		}
-		client := &http.Client{Timeout: 15 * time.Second}
-		resp, err := client.Get(p)
+
+		resp, err := posterHTTPClient.Get(u.String())
 		if err != nil {
-			return c.Status(502).JSON(fiber.Map{"error": err.Error()})
+			log.Printf("poster: upstream: %v", err)
+			return c.Status(502).JSON(fiber.Map{"error": "upstream failed"})
 		}
 		defer resp.Body.Close()
-		body, _ := io.ReadAll(resp.Body)
-		ct := resp.Header.Get("Content-Type")
-		if ct == "" {
-			ct = "image/jpeg"
+
+		if resp.StatusCode != http.StatusOK {
+			return c.Status(502).JSON(fiber.Map{"error": "upstream failed"})
 		}
+		ct := safeImageContentType(resp.Header.Get("Content-Type"))
+		if ct == "" {
+			return c.Status(502).JSON(fiber.Map{"error": "upstream returned non-image"})
+		}
+
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20+1))
+		if err != nil || len(body) > 10<<20 {
+			return c.Status(502).JSON(fiber.Map{"error": "upstream failed"})
+		}
+
 		c.Set("Content-Type", ct)
+		c.Set("X-Content-Type-Options", "nosniff")
+		c.Set("Content-Security-Policy", "default-src 'none'; sandbox")
 		c.Set("Cache-Control", "public, max-age=86400")
 		return c.Send(body)
 	})
@@ -584,16 +829,22 @@ func main() {
 		if _, err := os.Stat(full); err != nil {
 			return c.Status(404).JSON(fiber.Map{"error": "not found"})
 		}
+		ext := strings.ToLower(filepath.Ext(full))
+		isVideo := photoVideoExts[ext]
+		if !isVideo && !photoImageExts[ext] {
+			return c.Status(fiber.StatusUnsupportedMediaType).JSON(fiber.Map{"error": "unsupported file type"})
+		}
 		size := 400
 		if v, err := strconv.Atoi(c.Query("size", "400")); err == nil && v >= 64 && v <= 1600 {
 			size = v
 		}
-		isVideo := photoVideoExts[strings.ToLower(filepath.Ext(full))]
-		cachePath, err := ensurePhotoCache(rel, size, "thumb", full, isVideo)
+		cachePath, err := ensurePhotoCache(rel, size, photoCacheKindThumb, full, isVideo)
 		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": "thumbnail failed: " + err.Error()})
+			log.Printf("photos: thumbnail %q: %v", rel, err)
+			return c.Status(500).JSON(fiber.Map{"error": "thumbnail failed"})
 		}
 		c.Set("Content-Type", "image/jpeg")
+		c.Set("X-Content-Type-Options", "nosniff")
 		c.Set("Cache-Control", "public, max-age=86400")
 		return c.SendFile(cachePath)
 	})
@@ -639,32 +890,41 @@ func main() {
 		}
 		ext := strings.ToLower(filepath.Ext(full))
 		if photoVideoExts[ext] {
+			c.Set("X-Content-Type-Options", "nosniff")
 			return c.SendFile(full)
+		}
+		if !photoImageExts[ext] {
+			return c.Status(fiber.StatusUnsupportedMediaType).JSON(fiber.Map{"error": "unsupported file type"})
 		}
 		fullSize := 1200
 		if v, err := strconv.Atoi(platform.GetEnv("PHOTO_FULL_SIZE", "1200")); err == nil && v >= 320 && v <= 4000 {
 			fullSize = v
 		}
-		cachePath, err := ensurePhotoCache(rel, fullSize, "full", full, false)
+		cachePath, err := ensurePhotoCache(rel, fullSize, photoCacheKindFull, full, false)
 		if err != nil {
 			// Не смогли отресайзить — отдаём оригинал, чтобы фото не пропало.
+			log.Printf("photos: full %q: %v", rel, err)
+			c.Set("Content-Type", imageMime(ext))
+			c.Set("X-Content-Type-Options", "nosniff")
 			return c.SendFile(full)
 		}
 		c.Set("Content-Type", "image/jpeg")
+		c.Set("X-Content-Type-Options", "nosniff")
 		c.Set("Cache-Control", "public, max-age=86400")
 		return c.SendFile(cachePath)
 	})
 
 	// Очистка локального кэша фото.
-	app.Delete("/photos/cache", func(c fiber.Ctx) error {
+	app.Delete("/photos/cache", requireMediaAdmin, func(c fiber.Ctx) error {
 		if err := clearPhotoCache(); err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+			log.Printf("photos: clear cache: %v", err)
+			return c.Status(500).JSON(fiber.Map{"error": "cache clear failed"})
 		}
 		return c.JSON(fiber.Map{"status": "cache_cleared"})
 	})
 
 	// Открыть в VLC
-	app.Post("/open/:id", func(c fiber.Ctx) error {
+	app.Post("/open/:id", requireMediaAdmin, func(c fiber.Ctx) error {
 		id, err := strconv.Atoi(c.Params("id"))
 		if err != nil {
 			return c.Status(400).JSON(fiber.Map{"error": "invalid id"})
@@ -689,9 +949,15 @@ func main() {
 		if mediaType == "tv" {
 			f, err := firstVideoFile(p)
 			if err != nil {
-				return c.Status(404).JSON(fiber.Map{"error": err.Error()})
+				return c.Status(404).JSON(fiber.Map{"error": "not found"})
 			}
 			filePath = f
+		} else {
+			real, err := mediaFilePath(p, mediaType)
+			if err != nil {
+				return c.Status(404).JSON(fiber.Map{"error": "not found"})
+			}
+			filePath = real
 		}
 		return c.SendFile(filePath)
 	})
@@ -767,7 +1033,11 @@ func main() {
 		if err := db.QueryRow(ctx, `SELECT path FROM episodes WHERE id=$1`, id).Scan(&path); err != nil {
 			return c.Status(404).JSON(fiber.Map{"error": "not found"})
 		}
-		return c.SendFile(path)
+		real, err := mediaFilePath(path, "tv")
+		if err != nil {
+			return c.Status(404).JSON(fiber.Map{"error": "not found"})
+		}
+		return c.SendFile(real)
 	})
 
 	// Стрим эпизода с транскодом
@@ -780,7 +1050,11 @@ func main() {
 		if err := db.QueryRow(ctx, `SELECT path FROM episodes WHERE id=$1`, id).Scan(&path); err != nil {
 			return c.Status(404).JSON(fiber.Map{"error": "not found"})
 		}
-		return streamTranscoded(c, path)
+		real, err := mediaFilePath(path, "tv")
+		if err != nil {
+			return c.Status(404).JSON(fiber.Map{"error": "not found"})
+		}
+		return streamTranscoded(c, real)
 	})
 
 	// Субтитры эпизода
@@ -793,11 +1067,21 @@ func main() {
 		if err := db.QueryRow(ctx, `SELECT path FROM episodes WHERE id=$1`, id).Scan(&path); err != nil {
 			return c.Status(404).JSON(fiber.Map{"error": "not found"})
 		}
-		sub, err := findSubtitle(path)
+		real, err := mediaFilePath(path, "tv")
+		if err != nil {
+			return c.Status(404).JSON(fiber.Map{"error": "not found"})
+		}
+		sub, err := findSubtitle(real)
 		if err != nil {
 			return c.Status(404).JSON(fiber.Map{"error": "субтитры не найдены"})
 		}
+		sub, err = mediaFilePath(sub, "tv")
+		if err != nil {
+			return c.Status(404).JSON(fiber.Map{"error": "not found"})
+		}
 		c.Set("Content-Type", "application/x-subrip")
+		c.Set("X-Content-Type-Options", "nosniff")
+		c.Set("Content-Disposition", `inline; filename="subtitle"`)
 		return c.SendFile(sub)
 	})
 
@@ -816,11 +1100,12 @@ func main() {
 			return c.Status(404).JSON(fiber.Map{"error": "не удалось создать миниатюру"})
 		}
 		c.Set("Content-Type", "image/jpeg")
+		c.Set("X-Content-Type-Options", "nosniff")
 		return c.SendFile(thumb)
 	})
 
 	// Открыть эпизод в VLC
-	app.Post("/episode/:id/open", func(c fiber.Ctx) error {
+	app.Post("/episode/:id/open", requireMediaAdmin, func(c fiber.Ctx) error {
 		id, err := strconv.Atoi(c.Params("id"))
 		if err != nil {
 			return c.Status(400).JSON(fiber.Map{"error": "invalid id"})
@@ -863,7 +1148,11 @@ func main() {
 		if err := db.QueryRow(ctx, `SELECT path FROM episodes WHERE id=$1`, id).Scan(&path); err != nil {
 			return c.Status(404).JSON(fiber.Map{"error": "not found"})
 		}
-		subs := collectSubtitles(path)
+		real, err := mediaFilePath(path, "tv")
+		if err != nil {
+			return c.Status(404).JSON(fiber.Map{"error": "not found"})
+		}
+		subs := collectSubtitles(real)
 		list := []fiber.Map{}
 		for _, s := range subs {
 			list = append(list, fiber.Map{"idx": s.idx, "lang": s.lang, "label": s.label, "forced": s.forced})
@@ -890,14 +1179,44 @@ func main() {
 		if target == "" {
 			return c.Status(404).JSON(fiber.Map{"error": "нет субтитра"})
 		}
+		real, err := mediaFilePath(target, "tv")
+		if err != nil {
+			return c.Status(404).JSON(fiber.Map{"error": "not found"})
+		}
+		target = real
 		ext := strings.ToLower(filepath.Ext(target))
 		if ext == ".ass" || ext == ".sub" {
-			cached := fmt.Sprintf("/tmp/sub-%d-%d.vtt", id, idx)
-			if _, err := os.Stat(cached); os.IsNotExist(err) {
-				_ = exec.Command("ffmpeg", "-y", "-i", target, cached).Run()
+			unlock := lockPhotoCache(fmt.Sprintf("sub:%d:%d", id, idx))
+			defer unlock()
+
+			cached := filepath.Join(photoCacheDir, fmt.Sprintf("sub-%d-%d.vtt", id, idx))
+			if fi, err := os.Stat(cached); err != nil || fi.Size() == 0 {
+				if err := os.MkdirAll(photoCacheDir, 0o700); err == nil {
+					tmp, terr := os.CreateTemp(photoCacheDir, ".sub-*.vtt")
+					if terr == nil {
+						tmpPath := tmp.Name()
+						_ = tmp.Close()
+						octx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+						cmd := exec.CommandContext(octx, "ffmpeg",
+							"-nostdin", "-y", "-hide_banner", "-loglevel", "error",
+							"-protocol_whitelist", "file",
+							"-i", target, tmpPath)
+						cmd.WaitDelay = 2 * time.Second
+						cerr := cmd.Run()
+						cancel()
+						if cerr == nil {
+							cerr = os.Rename(tmpPath, cached)
+						}
+						if cerr != nil {
+							_ = os.Remove(tmpPath)
+						}
+					}
+				}
 			}
-			if _, err := os.Stat(cached); err == nil {
+			if fi, err := os.Stat(cached); err == nil && fi.Size() > 0 {
 				c.Set("Content-Type", "text/vtt")
+				c.Set("X-Content-Type-Options", "nosniff")
+				c.Set("Content-Disposition", `inline; filename="sub.vtt"`)
 				return c.SendFile(cached)
 			}
 		}
@@ -906,6 +1225,8 @@ func main() {
 		} else {
 			c.Set("Content-Type", "application/x-subrip")
 		}
+		c.Set("X-Content-Type-Options", "nosniff")
+		c.Set("Content-Disposition", `inline; filename="subtitle`+ext+`"`)
 		return c.SendFile(target)
 	})
 
@@ -928,8 +1249,14 @@ func main() {
 		if err := c.Bind().JSON(&body); err != nil {
 			return c.Status(400).JSON(fiber.Map{"error": "invalid body"})
 		}
-		if body.MediaType == "" || body.MediaID <= 0 {
-			return c.Status(400).JSON(fiber.Map{"error": "нужны media_type и media_id"})
+		if body.MediaType != "movie" && body.MediaType != "tv" {
+			return c.Status(400).JSON(fiber.Map{"error": "media_type must be movie or tv"})
+		}
+		if body.MediaID <= 0 || body.PositionSec < 0 || body.DurationSec < 0 {
+			return c.Status(400).JSON(fiber.Map{"error": "invalid progress"})
+		}
+		if body.DurationSec > 0 && body.PositionSec > body.DurationSec {
+			body.PositionSec = body.DurationSec
 		}
 		// Досмотрел (>95%) — удаляем
 		if body.DurationSec > 0 && body.PositionSec >= int(float64(body.DurationSec)*0.95) {
@@ -997,9 +1324,13 @@ func main() {
 		if q == "" {
 			return c.Status(400).JSON(fiber.Map{"error": "q is required"})
 		}
+		if mediaType != "movie" && mediaType != "tv" {
+			return c.Status(400).JSON(fiber.Map{"error": "invalid type"})
+		}
 		res, err := searchTMDB(mediaType, q, 0)
 		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+			log.Printf("match/search: %v", err)
+			return c.Status(502).JSON(fiber.Map{"error": "tmdb failed"})
 		}
 		results := []fiber.Map{}
 		for _, r := range res.Results {
@@ -1207,7 +1538,7 @@ func main() {
 	})
 
 	// Применить авто-переименование
-	app.Post("/rename/apply", func(c fiber.Ctx) error {
+	app.Post("/rename/apply", requireMediaAdmin, func(c fiber.Ctx) error {
 		var body struct {
 			ID int `json:"id"`
 		}
@@ -1229,7 +1560,11 @@ func main() {
 
 		movieGenres := map[string]int{}
 		tvGenres := map[string]int{}
-		rows, _ := db.Query(ctx, `SELECT media_type, genres FROM media WHERE genres <> ''`)
+		rows, err := db.Query(ctx, `SELECT media_type, genres FROM media WHERE genres <> ''`)
+		if err != nil {
+			log.Printf("library/stats genres: %v", err)
+			return c.Status(500).JSON(fiber.Map{"error": "internal error"})
+		}
 		for rows.Next() {
 			var mt, g string
 			if rows.Scan(&mt, &g) == nil {
@@ -1247,9 +1582,16 @@ func main() {
 			}
 		}
 		rows.Close()
+		if err := rows.Err(); err != nil {
+			log.Printf("library/stats genres rows: %v", err)
+		}
 
 		movieYears := []fiber.Map{}
-		yrows, _ := db.Query(ctx, `SELECT year, COUNT(*) FROM media WHERE media_type='movie' AND year > 0 GROUP BY year ORDER BY year`)
+		yrows, err := db.Query(ctx, `SELECT year, COUNT(*) FROM media WHERE media_type='movie' AND year > 0 GROUP BY year ORDER BY year`)
+		if err != nil {
+			log.Printf("library/stats years: %v", err)
+			return c.Status(500).JSON(fiber.Map{"error": "internal error"})
+		}
 		for yrows.Next() {
 			var y, c int
 			if yrows.Scan(&y, &c) == nil {
@@ -1257,6 +1599,9 @@ func main() {
 			}
 		}
 		yrows.Close()
+		if err := yrows.Err(); err != nil {
+			log.Printf("library/stats years rows: %v", err)
+		}
 
 		return c.JSON(fiber.Map{
 			"movies": fiber.Map{"total": movieTotal, "with_poster": movieWithPoster, "by_genre": movieGenres, "by_year": movieYears},
@@ -1521,6 +1866,50 @@ func main() {
 	log.Fatal(app.Listen(":8091"))
 }
 
+const (
+	scanLockKey = "media:scan:running"
+	scanLockTTL = 2 * time.Hour
+)
+
+// releaseLockScript удаляет лок только если он всё ещё принадлежит нам:
+// иначе зависший воркер мог бы снять чужой лок после истечения TTL.
+var releaseLockScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+	return redis.call("DEL", KEYS[1])
+end
+return 0`)
+
+var refreshLockScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+	return redis.call("EXPIRE", KEYS[1], ARGV[2])
+end
+return 0`)
+
+func newLockToken() string {
+	return fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
+}
+
+func acquireScanLock() (string, bool, error) {
+	token := newLockToken()
+	ok, err := rdb.SetNX(ctx, scanLockKey, token, scanLockTTL).Result()
+	if err != nil {
+		return "", false, err
+	}
+	return token, ok, nil
+}
+
+func releaseRedisLock(key, token string) {
+	if err := releaseLockScript.Run(ctx, rdb, []string{key}, token).Err(); err != nil {
+		log.Printf("redis unlock %s: %v", key, err)
+	}
+}
+
+func releaseScanLock(token string) { releaseRedisLock(scanLockKey, token) }
+
+func refreshScanLock(token string) {
+	_ = refreshLockScript.Run(ctx, rdb, []string{scanLockKey}, token, int(scanLockTTL.Seconds())).Err()
+}
+
 // startAutoScan — фоновый периодический скан библиотеки.
 func startAutoScan() {
 	interval := 60
@@ -1530,13 +1919,13 @@ func startAutoScan() {
 	log.Printf("🔄 Авто-скан каждые %d минут", interval)
 	for {
 		time.Sleep(time.Duration(interval) * time.Minute)
-		ok, err := rdb.SetNX(ctx, "media:scan:running", "true", 10*time.Minute).Result()
+		token, ok, err := acquireScanLock()
 		if err != nil || !ok {
 			continue
 		}
-		_ = rdb.Set(ctx, "media:scan:progress", "0", 10*time.Minute).Err()
-		_ = rdb.Set(ctx, "media:scan:total", "0", 10*time.Minute).Err()
-		go runScan()
+		_ = rdb.Set(ctx, "media:scan:progress", "0", scanLockTTL).Err()
+		_ = rdb.Set(ctx, "media:scan:total", "0", scanLockTTL).Err()
+		go runScan(token)
 	}
 }
 
@@ -1544,16 +1933,30 @@ func startAutoScan() {
 // WATCHDOG (fsnotify) — мгновенное обнаружение новых файлов
 // ============================================================
 
-func isVideoExt(ext string) bool {
-	switch ext {
-	case ".mkv", ".mp4", ".avi", ".m4v", ".mov", ".webm":
-		return true
+// normalizeMediaExt приводит расширение к виду ".mkv" в нижнем регистре:
+// вызывающие передают и "mkv", и ".MKV".
+func normalizeMediaExt(ext string) string {
+	ext = strings.ToLower(strings.TrimSpace(ext))
+	if ext != "" && !strings.HasPrefix(ext, ".") {
+		ext = "." + ext
 	}
-	return false
+	return ext
+}
+
+// videoExts — единственный список видео-расширений: isVideoExt и
+// stripExtension обязаны смотреть сюда, иначе файл есть в индексе,
+// но не открывается/не чистится.
+var videoExts = map[string]struct{}{
+	".mkv": {}, ".mp4": {}, ".avi": {}, ".m4v": {}, ".mov": {}, ".webm": {}, ".wmv": {},
+}
+
+func isVideoExt(ext string) bool {
+	_, ok := videoExts[normalizeMediaExt(ext)]
+	return ok
 }
 
 func isAudioExt(ext string) bool {
-	switch ext {
+	switch normalizeMediaExt(ext) {
 	case ".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".dsf", ".dff", ".ape":
 		return true
 	}
@@ -1795,8 +2198,10 @@ func handleNewFile(path string) {
 	log.Printf("🆕 Watchdog: %s [%s] %s", title, kind, filepath.Base(path))
 }
 
-func migrate() error {
-	_, err := db.Exec(ctx, `
+func migrate() error { return migrateWith(ctx, db) }
+
+func migrateWith(queryCtx context.Context, pool *pgxpool.Pool) error {
+	_, err := pool.Exec(queryCtx, `
 		CREATE TABLE IF NOT EXISTS media (
 			id SERIAL PRIMARY KEY,
 			path TEXT UNIQUE NOT NULL,
@@ -2215,49 +2620,60 @@ func applyRename(id int) error {
 	if err != nil {
 		return err
 	}
-	if p.MediaType == "tv" {
-		tvDir := platform.GetEnv("MEDIA_TV_DIR", "/tv")
-		oldDir := p.CurrentPath
-		newDir := filepath.Join(tvDir, p.SuggestedPath)
-		if oldDir == newDir {
-			return nil
-		}
-		if _, err := os.Stat(newDir); err == nil {
-			return fmt.Errorf("целевой путь уже существует")
-		}
-		if err := os.MkdirAll(filepath.Dir(newDir), 0o755); err != nil {
-			return err
-		}
-		if err := os.Rename(oldDir, newDir); err != nil {
-			return fmt.Errorf("os.Rename: %w", err)
-		}
-		_, _ = db.Exec(ctx, `UPDATE media SET path=$1 WHERE id=$2`, newDir, id)
-		// обновляем пути эпизодов с новым префиксом
-		for _, ep := range p.Episodes {
-			rel, rerr := filepath.Rel(oldDir, ep.CurrentPath)
-			if rerr != nil {
-				continue
-			}
-			_, _ = db.Exec(ctx, `UPDATE episodes SET path=$1 WHERE id=$2`, filepath.Join(newDir, rel), ep.ID)
-		}
-		return nil
-	}
 
-	moviesDir := platform.GetEnv("MEDIA_MOVIES_DIR", "/movies")
-	newPath := filepath.Join(moviesDir, p.SuggestedPath)
-	if p.CurrentPath == newPath {
+	root := libraryRoot(p.MediaType)
+	oldPath := filepath.Clean(p.CurrentPath)
+	if !withinRoot(root, oldPath) {
+		return fmt.Errorf("текущий путь вне библиотеки")
+	}
+	newPath := filepath.Clean(filepath.Join(root, p.SuggestedPath))
+	if !withinRoot(root, newPath) {
+		return fmt.Errorf("целевой путь вне библиотеки")
+	}
+	if oldPath == newPath {
 		return nil
 	}
-	if _, err := os.Stat(newPath); err == nil {
+	if _, err := os.Lstat(newPath); err == nil {
 		return fmt.Errorf("целевой путь уже существует")
 	}
 	if err := os.MkdirAll(filepath.Dir(newPath), 0o755); err != nil {
 		return err
 	}
-	if err := os.Rename(p.CurrentPath, newPath); err != nil {
+	if err := os.Rename(oldPath, newPath); err != nil {
 		return fmt.Errorf("os.Rename: %w", err)
 	}
-	_, _ = db.Exec(ctx, `UPDATE media SET path=$1 WHERE id=$2`, newPath, id)
+
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		_ = os.Rename(newPath, oldPath)
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	fail := func(err error) error {
+		_ = tx.Rollback(ctx)
+		_ = os.Rename(newPath, oldPath)
+		return err
+	}
+
+	if _, err := tx.Exec(ctx, `UPDATE media SET path=$1 WHERE id=$2`, newPath, id); err != nil {
+		return fail(err)
+	}
+	if p.MediaType == "tv" {
+		for _, ep := range p.Episodes {
+			rel, rerr := filepath.Rel(oldPath, ep.CurrentPath)
+			if rerr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+				return fail(fmt.Errorf("эпизод %d вне каталога сериала", ep.ID))
+			}
+			if _, err := tx.Exec(ctx, `UPDATE episodes SET path=$1 WHERE id=$2`,
+				filepath.Join(newPath, rel), ep.ID); err != nil {
+				return fail(err)
+			}
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		_ = os.Rename(newPath, oldPath)
+		return err
+	}
 	return nil
 }
 
@@ -2270,14 +2686,20 @@ type scanItem struct {
 	mediaType string
 }
 
-func runScan() {
+func runScan(token string) {
+	defer releaseScanLock(token)
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("scan: panic: %v", r)
+		}
+	}()
+
 	moviesDir := platform.GetEnv("MEDIA_MOVIES_DIR", "/movies")
 	tvDir := platform.GetEnv("MEDIA_TV_DIR", "/tv")
-	videoExts := map[string]bool{".mkv": true, ".mp4": true, ".avi": true}
 
 	items := []scanItem{}
 	filepath.WalkDir(moviesDir, func(p string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() || !videoExts[strings.ToLower(filepath.Ext(p))] {
+		if err != nil || d.IsDir() || !isVideoExt(strings.ToLower(filepath.Ext(p))) {
 			return nil
 		}
 		items = append(items, scanItem{path: p, mediaType: "movie"})
@@ -2292,11 +2714,16 @@ func runScan() {
 	}
 
 	total := len(items)
-	_ = rdb.Set(ctx, "media:scan:total", strconv.Itoa(total), 10*time.Minute).Err()
-	_ = rdb.Set(ctx, "media:scan:progress", "0", 10*time.Minute).Err()
+	_ = rdb.Set(ctx, "media:scan:total", strconv.Itoa(total), scanLockTTL).Err()
+	_ = rdb.Set(ctx, "media:scan:progress", "0", scanLockTTL).Err()
 
+	lastRefresh := time.Now()
 	added, updated, errCount := 0, 0, 0
 	for i, it := range items {
+		if time.Since(lastRefresh) >= 30*time.Second {
+			refreshScanLock(token)
+			lastRefresh = time.Now()
+		}
 		title, year := parseName(filepath.Base(it.path))
 		if title != "" {
 			a, u, e := upsertMedia(it.path, it.mediaType, title, year)
@@ -2313,20 +2740,15 @@ func runScan() {
 				}
 			}
 		}
-		_ = rdb.Set(ctx, "media:scan:progress", strconv.Itoa(i+1), 10*time.Minute).Err()
+		_ = rdb.Set(ctx, "media:scan:progress", strconv.Itoa(i+1), scanLockTTL).Err()
 	}
 
-	_ = rdb.Set(ctx, "media:scan:running", "false", 10*time.Minute).Err()
 	_ = rdb.Set(ctx, "media:scan:last", time.Now().Format(time.RFC3339), 10*time.Minute).Err()
 	result, _ := json.Marshal(map[string]int{"added": added, "updated": updated, "errors": errCount, "total": total})
 	_ = rdb.Set(ctx, "media:scan:result", string(result), 10*time.Minute).Err()
 }
 
 func upsertMedia(p, mediaType, title string, year int) (int, int, error) {
-	var existingID int
-	err := db.QueryRow(ctx, `SELECT id FROM media WHERE path = $1`, p).Scan(&existingID)
-	exists := err == nil && existingID > 0
-
 	d, err := lookupTMDB(mediaType, title, year)
 	if err != nil {
 		log.Printf("⚠️ TMDb: %v", err)
@@ -2385,40 +2807,41 @@ func upsertMedia(p, mediaType, title string, year int) (int, int, error) {
 		}
 	}
 
-	if exists {
-		_, err = db.Exec(ctx, `
-			UPDATE media SET title=$1, original_title=$2, year=$3, tmdb_id=$4, overview=$5,
-				poster_url=$6, backdrop_url=$7, rating=$8, genres=$9, runtime=$10, scanned_at=NOW()
-			WHERE id=$11`,
-			displayTitle, originalTitle, finalYear, tmdbID, overview, posterURL, backdropURL, rating, genres, runtime, existingID)
-		if err != nil {
-			return 0, 0, err
-		}
-		if mediaType == "movie" && d != nil {
-			linkCollection(existingID, d)
-		}
-		if tmdbID > 0 && !hasPeople(existingID) {
-			syncCredits(existingID, mediaType, tmdbID)
-		}
-		return 0, 1, nil
-	}
-
-	_, err = db.Exec(ctx, `
+	hasMeta := d != nil
+	var id int
+	var inserted bool
+	err = db.QueryRow(ctx, `
 		INSERT INTO media (path, media_type, title, original_title, year, tmdb_id, overview, poster_url, backdrop_url, rating, genres, runtime)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-		p, mediaType, displayTitle, originalTitle, finalYear, tmdbID, overview, posterURL, backdropURL, rating, genres, runtime)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+		ON CONFLICT (path) DO UPDATE SET
+			title = CASE WHEN $13 THEN EXCLUDED.title ELSE media.title END,
+			original_title = CASE WHEN $13 THEN EXCLUDED.original_title ELSE media.original_title END,
+			year = CASE WHEN $13 THEN EXCLUDED.year ELSE media.year END,
+			tmdb_id = CASE WHEN $13 THEN EXCLUDED.tmdb_id ELSE media.tmdb_id END,
+			overview = CASE WHEN $13 THEN EXCLUDED.overview ELSE media.overview END,
+			poster_url = CASE WHEN $13 THEN EXCLUDED.poster_url ELSE media.poster_url END,
+			backdrop_url = CASE WHEN $13 THEN EXCLUDED.backdrop_url ELSE media.backdrop_url END,
+			rating = CASE WHEN $13 THEN EXCLUDED.rating ELSE media.rating END,
+			genres = CASE WHEN $13 THEN EXCLUDED.genres ELSE media.genres END,
+			runtime = CASE WHEN $13 THEN EXCLUDED.runtime ELSE media.runtime END,
+			scanned_at = NOW()
+		RETURNING id, (xmax = 0)`,
+		p, mediaType, displayTitle, originalTitle, finalYear, tmdbID,
+		overview, posterURL, backdropURL, rating, genres, runtime, hasMeta).Scan(&id, &inserted)
 	if err != nil {
 		return 0, 0, err
 	}
-	var newID int
-	_ = db.QueryRow(ctx, `SELECT id FROM media WHERE path=$1`, p).Scan(&newID)
+
 	if mediaType == "movie" && d != nil {
-		linkCollection(newID, d)
+		linkCollection(id, d)
 	}
-	if tmdbID > 0 {
-		syncCredits(newID, mediaType, tmdbID)
+	if tmdbID > 0 && (inserted || !hasPeople(id)) {
+		syncCredits(id, mediaType, tmdbID)
 	}
-	return 1, 0, nil
+	if inserted {
+		return 1, 0, nil
+	}
+	return 0, 1, nil
 }
 
 func hasPeople(mediaID int) bool {
@@ -2483,10 +2906,9 @@ func mediaIDByPath(path string) (int, error) {
 }
 
 func scanEpisodes(seriesID int, dir string) {
-	videoExts := map[string]bool{".mkv": true, ".mp4": true, ".avi": true, ".m4v": true}
 	files := []string{}
 	filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() || !videoExts[strings.ToLower(filepath.Ext(p))] {
+		if err != nil || d.IsDir() || !isVideoExt(strings.ToLower(filepath.Ext(p))) {
 			return nil
 		}
 		files = append(files, p)
@@ -2705,18 +3127,53 @@ func findSubtitle(videoPath string) (string, error) {
 }
 
 func episodeThumbnail(id int, videoPath string) string {
-	thumbPath := fmt.Sprintf("/tmp/thumb-%d.jpg", id)
-	if info, err := os.Stat(thumbPath); err == nil && time.Since(info.ModTime()) < 24*time.Hour {
-		return thumbPath
-	}
-	_ = exec.Command("ffmpeg", "-y", "-ss", "00:05:00", "-i", videoPath, "-vframes", "1", "-vf", "scale=320:-2", thumbPath).Run()
-	if _, err := os.Stat(thumbPath); err != nil {
-		_ = exec.Command("ffmpeg", "-y", "-ss", "00:01:00", "-i", videoPath, "-vframes", "1", "-vf", "scale=320:-2", thumbPath).Run()
-	}
-	if _, err := os.Stat(thumbPath); err != nil {
+	real, err := mediaFilePath(videoPath, "tv")
+	if err != nil {
 		return ""
 	}
-	return thumbPath
+
+	unlock := lockPhotoCache(fmt.Sprintf("ep-thumb:%d", id))
+	defer unlock()
+
+	dst := filepath.Join(photoCacheDir, fmt.Sprintf("ep-thumb-%d.jpg", id))
+	if info, err := os.Stat(dst); err == nil && info.Size() > 0 && time.Since(info.ModTime()) < 24*time.Hour {
+		return dst
+	}
+	if err := os.MkdirAll(photoCacheDir, 0o700); err != nil {
+		return ""
+	}
+	tmp, err := os.CreateTemp(photoCacheDir, fmt.Sprintf(".ep-thumb-%d-*.jpg", id))
+	if err != nil {
+		return ""
+	}
+	tmpPath := tmp.Name()
+	_ = tmp.Close()
+	defer os.Remove(tmpPath)
+
+	for _, seek := range []string{"00:05:00", "00:01:00"} {
+		octx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		cmd := exec.CommandContext(octx, "ffmpeg",
+			"-nostdin", "-y", "-hide_banner", "-loglevel", "error",
+			"-protocol_whitelist", "file",
+			"-ss", seek,
+			"-i", real,
+			"-frames:v", "1",
+			"-vf", "scale=320:-2",
+			tmpPath,
+		)
+		cmd.WaitDelay = 2 * time.Second
+		cerr := cmd.Run()
+		cancel()
+		if cerr != nil {
+			continue
+		}
+		if fi, err := os.Stat(tmpPath); err == nil && fi.Size() > 0 {
+			if os.Rename(tmpPath, dst) == nil {
+				return dst
+			}
+		}
+	}
+	return ""
 }
 
 // ============================================================
@@ -2766,18 +3223,36 @@ type tmdbDetail struct {
 	} `json:"belongs_to_collection"`
 }
 
+var upstreamHTTPClient = &http.Client{Timeout: 15 * time.Second}
+
 func httpGetJSON(u string, out interface{}) error {
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Get(u)
+	resp, err := upstreamHTTPClient.Get(u)
 	if err != nil {
-		return err
+		if ue, ok := err.(*url.Error); ok {
+			return fmt.Errorf("%s %s: %v", ue.Op, redactURL(ue.URL), ue.Err)
+		}
+		return fmt.Errorf("upstream request failed")
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+		return fmt.Errorf("upstream status %d", resp.StatusCode)
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	return json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(out)
+}
+
+// redactURL скрывает api_key в сообщениях об ошибках/логах.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "<invalid-url>"
+	}
+	q := u.Query()
+	if q.Get("api_key") != "" {
+		q.Set("api_key", "REDACTED")
+		u.RawQuery = q.Encode()
+	}
+	return u.Redacted()
 }
 
 // tmdbGetJSON — как httpGetJSON, но с повтором при rate limit (429).
@@ -3064,17 +3539,20 @@ func wishlistAdd(tmdbID int, mediaType string) (*wishlistItem, error) {
 // wishlistCheck отмечает вышедшие релизы (release_date <= today) и публикует события.
 // onlyID > 0 — проверить только одну запись.
 func wishlistCheck(onlyID int) []wishlistItem {
-	query := `SELECT ` + wishlistCols + ` FROM wishlist
+	// Атомарно «забираем» релизы: UPDATE ... RETURNING гарантирует, что при
+	// параллельных вызовах каждое событие публикуется ровно один раз.
+	query := `UPDATE wishlist SET notified=TRUE
 		WHERE COALESCE(notified,false)=FALSE AND release_date IS NOT NULL AND release_date <= CURRENT_DATE`
 	args := []interface{}{}
 	if onlyID > 0 {
 		query += ` AND id=$1`
 		args = append(args, onlyID)
 	}
-	query += ` ORDER BY release_date ASC`
+	query += ` RETURNING ` + wishlistCols
 
 	rows, err := db.Query(ctx, query, args...)
 	if err != nil {
+		log.Printf("wishlist check: %v", err)
 		return []wishlistItem{}
 	}
 	released := []wishlistItem{}
@@ -3084,13 +3562,25 @@ func wishlistCheck(onlyID int) []wishlistItem {
 		}
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		log.Printf("wishlist check rows: %v", err)
+		return released
+	}
 
-	for _, w := range released {
-		_, _ = db.Exec(ctx, `UPDATE wishlist SET notified=TRUE WHERE id=$1`, w.ID)
-		_ = rdb.Publish(ctx, "wishlist.released", w.Title).Err()
-		_ = rdb.Incr(ctx, "wishlist:released_count").Err()
+	if len(released) > 0 {
+		for _, w := range released {
+			_ = rdb.Publish(ctx, "wishlist.released", w.Title).Err()
+		}
+		_ = rdb.IncrBy(ctx, "wishlist:released_count", int64(len(released))).Err()
 	}
 	return released
+}
+
+func validMediaType(mediaType string) string {
+	if mediaType == "tv" {
+		return "tv"
+	}
+	return "movie"
 }
 
 func searchTMDB(mediaType, title string, year int) (*tmdbSearchResponse, error) {
@@ -3098,15 +3588,22 @@ func searchTMDB(mediaType, title string, year int) (*tmdbSearchResponse, error) 
 	if key == "" {
 		return nil, fmt.Errorf("TMDB_API_KEY не задан")
 	}
+	mediaType = validMediaType(mediaType)
 	lang := platform.GetEnv("TMDB_LANG", "ru-RU")
-	u := fmt.Sprintf("https://api.themoviedb.org/3/search/%s?api_key=%s&query=%s&language=%s", mediaType, key, url.QueryEscape(title), lang)
+
+	q := url.Values{}
+	q.Set("api_key", key)
+	q.Set("query", title)
+	q.Set("language", lang)
 	if year > 0 {
 		if mediaType == "tv" {
-			u += fmt.Sprintf("&first_air_date_year=%d", year)
+			q.Set("first_air_date_year", strconv.Itoa(year))
 		} else {
-			u += fmt.Sprintf("&year=%d", year)
+			q.Set("year", strconv.Itoa(year))
 		}
 	}
+	u := "https://api.themoviedb.org/3/search/" + mediaType + "?" + q.Encode()
+
 	var res tmdbSearchResponse
 	if err := httpGetJSON(u, &res); err != nil {
 		return nil, err
@@ -3123,8 +3620,12 @@ type tmdbVideos struct {
 }
 
 func tmdbTrailer(mediaType string, id int) string {
+	mediaType = validMediaType(mediaType)
 	cacheKey := fmt.Sprintf("tmdb:trailer:%s:%d", mediaType, id)
 	if cached, err := rdb.Get(ctx, cacheKey).Result(); err == nil && cached != "" {
+		if cached == "null" {
+			return ""
+		}
 		return cached
 	}
 	key := platform.GetEnv("TMDB_API_KEY", "")
@@ -3132,7 +3633,7 @@ func tmdbTrailer(mediaType string, id int) string {
 	u := fmt.Sprintf("https://api.themoviedb.org/3/%s/%d/videos?api_key=%s&language=%s", mediaType, id, key, lang)
 	var v tmdbVideos
 	if err := httpGetJSON(u, &v); err != nil {
-		_ = rdb.Set(ctx, cacheKey, "", 24*time.Hour).Err()
+		_ = rdb.Set(ctx, cacheKey, "null", 10*time.Minute).Err()
 		return ""
 	}
 	trailer := ""
@@ -3142,11 +3643,16 @@ func tmdbTrailer(mediaType string, id int) string {
 			break
 		}
 	}
-	_ = rdb.Set(ctx, cacheKey, trailer, 24*time.Hour).Err()
+	if trailer == "" {
+		_ = rdb.Set(ctx, cacheKey, "null", time.Hour).Err()
+	} else {
+		_ = rdb.Set(ctx, cacheKey, trailer, 24*time.Hour).Err()
+	}
 	return trailer
 }
 
 func tmdbDetails(mediaType string, id int) (*tmdbDetail, error) {
+	mediaType = validMediaType(mediaType)
 	key := platform.GetEnv("TMDB_API_KEY", "")
 	lang := platform.GetEnv("TMDB_LANG", "ru-RU")
 	u := fmt.Sprintf("https://api.themoviedb.org/3/%s/%d?api_key=%s&language=%s", mediaType, id, key, lang)
@@ -3226,13 +3732,13 @@ func profileURL(path string) string {
 	return "https://image.tmdb.org/t/p/w185" + path
 }
 
-// upsertPerson сохраняет персону и возвращает её внутренний id.
-func upsertPerson(tmdbID int, name, profile string) (int, error) {
+// upsertPersonTx сохраняет персону в транзакции и возвращает её внутренний id.
+func upsertPersonTx(tx pgx.Tx, tmdbID int, name, profile string) (int, error) {
 	if tmdbID <= 0 || name == "" {
 		return 0, fmt.Errorf("invalid person")
 	}
 	var id int
-	err := db.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		INSERT INTO people (tmdb_id, name, profile_url, scanned_at)
 		VALUES ($1,$2,$3,NOW())
 		ON CONFLICT (tmdb_id) DO UPDATE SET name=EXCLUDED.name, profile_url=EXCLUDED.profile_url, scanned_at=NOW()
@@ -3249,22 +3755,42 @@ func syncCredits(mediaID int, mediaType string, tmdbID int) {
 	if key == "" {
 		return
 	}
+	if mediaType != "movie" && mediaType != "tv" {
+		return
+	}
 	lang := platform.GetEnv("TMDB_LANG", "ru-RU")
 	u := fmt.Sprintf("https://api.themoviedb.org/3/%s/%d/credits?api_key=%s&language=%s", mediaType, tmdbID, key, lang)
 
-	var cr tmdbCredits
-	err := httpGetJSON(u, &cr)
-	if err != nil && strings.Contains(err.Error(), "429") {
-		time.Sleep(time.Second)
-		err = httpGetJSON(u, &cr)
+	// Лок до HTTP-запроса: параллельные сканы не должны дублировать запрос
+	// и конкурентно перезаписывать media_people.
+	if rdb != nil {
+		lockKey := fmt.Sprintf("media:credits:lock:%d", mediaID)
+		token := newLockToken()
+		ok, err := rdb.SetNX(ctx, lockKey, token, 2*time.Minute).Result()
+		if err != nil || !ok {
+			return
+		}
+		defer releaseRedisLock(lockKey, token)
 	}
-	if err != nil {
+
+	var cr tmdbCredits
+	if err := tmdbGetJSON(u, &cr); err != nil {
 		log.Printf("⚠️ TMDb credits %s/%d: %v", mediaType, tmdbID, err)
 		return
 	}
 
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		log.Printf("credits: begin %d: %v", mediaID, err)
+		return
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
 	// начинаем с чистого листа для этого media
-	_, _ = db.Exec(ctx, `DELETE FROM media_people WHERE media_id=$1`, mediaID)
+	if _, err := tx.Exec(ctx, `DELETE FROM media_people WHERE media_id=$1`, mediaID); err != nil {
+		log.Printf("credits: delete %d: %v", mediaID, err)
+		return
+	}
 
 	// актёры: топ-10 по порядку
 	cast := cr.Cast
@@ -3273,13 +3799,16 @@ func syncCredits(mediaID int, mediaType string, tmdbID int) {
 		if i >= 10 {
 			break
 		}
-		pid, err := upsertPerson(a.ID, a.Name, profileURL(a.ProfilePath))
+		pid, err := upsertPersonTx(tx, a.ID, a.Name, profileURL(a.ProfilePath))
 		if err != nil {
 			continue
 		}
-		_, _ = db.Exec(ctx, `
+		if _, err := tx.Exec(ctx, `
 			INSERT INTO media_people (media_id, person_id, role, character, ord)
-			VALUES ($1,$2,'actor',$3,$4) ON CONFLICT DO NOTHING`, mediaID, pid, a.Character, i)
+			VALUES ($1,$2,'actor',$3,$4) ON CONFLICT DO NOTHING`, mediaID, pid, a.Character, i); err != nil {
+			log.Printf("credits: actor %d: %v", mediaID, err)
+			return
+		}
 	}
 
 	// режиссёр(ы)
@@ -3287,13 +3816,20 @@ func syncCredits(mediaID int, mediaType string, tmdbID int) {
 		if c.Job != "Director" {
 			continue
 		}
-		pid, err := upsertPerson(c.ID, c.Name, profileURL(c.ProfilePath))
+		pid, err := upsertPersonTx(tx, c.ID, c.Name, profileURL(c.ProfilePath))
 		if err != nil {
 			continue
 		}
-		_, _ = db.Exec(ctx, `
+		if _, err := tx.Exec(ctx, `
 			INSERT INTO media_people (media_id, person_id, role, character, ord)
-			VALUES ($1,$2,'director',NULL,0) ON CONFLICT DO NOTHING`, mediaID, pid)
+			VALUES ($1,$2,'director',NULL,0) ON CONFLICT DO NOTHING`, mediaID, pid); err != nil {
+			log.Printf("credits: director %d: %v", mediaID, err)
+			return
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		log.Printf("credits: commit %d: %v", mediaID, err)
 	}
 }
 
@@ -3313,21 +3849,19 @@ func openMedia(id int) error {
 			return err
 		}
 		filePath = f
+	} else {
+		real, err := mediaFilePath(p, mediaType)
+		if err != nil {
+			return err
+		}
+		filePath = real
 	}
 
-	hostPath := toHostPath(filePath, mediaType)
-	openerURL := platform.GetEnv("BOOKS_OPENER_URL", "http://localhost:9999")
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(openerURL + "/open-media?path=" + url.QueryEscape(hostPath))
+	hostPath, err := toHostPath(filePath, mediaType)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("opener: %s", string(body))
-	}
-	return nil
+	return callOpener(hostPath)
 }
 
 func openEpisode(id int) error {
@@ -3335,42 +3869,92 @@ func openEpisode(id int) error {
 	if err := db.QueryRow(ctx, `SELECT path FROM episodes WHERE id=$1`, id).Scan(&path); err != nil {
 		return fmt.Errorf("не найдено")
 	}
-	hostPath := toHostPath(path, "tv")
-	openerURL := platform.GetEnv("BOOKS_OPENER_URL", "http://localhost:9999")
+	real, err := mediaFilePath(path, "tv")
+	if err != nil {
+		return err
+	}
+	hostPath, err := toHostPath(real, "tv")
+	if err != nil {
+		return err
+	}
+	return callOpener(hostPath)
+}
+
+// callOpener — единственная точка вызова books-opener (POST + обязательный
+// заголовок X-Opener; токен, если задан).
+func callOpener(hostPath string) error {
+	openerURL := strings.TrimRight(platform.GetEnv("BOOKS_OPENER_URL", "http://localhost:9999"), "/")
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		openerURL+"/open-media?path="+url.QueryEscape(hostPath), nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-Opener", "1")
+	if token := strings.TrimSpace(platform.GetEnv("OPENER_TOKEN", "")); token != "" {
+		req.Header.Set("X-Opener-Token", token)
+	}
+
 	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(openerURL + "/open-media?path=" + url.QueryEscape(hostPath))
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("opener: %s", string(body))
+		return fmt.Errorf("opener: status %d", resp.StatusCode)
 	}
 	return nil
 }
 
-// toHostPath переводит контейнерный путь в хост-путь (для books-opener на хосте)
-func toHostPath(containerPath, mediaType string) string {
-	if mediaType == "tv" {
-		hostDir := platform.GetEnv("MEDIA_TV_HOST_DIR", "/mnt/nas/root/FuzzyHD/TV")
-		rel := strings.TrimPrefix(containerPath, platform.GetEnv("MEDIA_TV_DIR", "/tv"))
-		return filepath.Join(hostDir, rel)
+// toHostPath переводит контейнерный путь в хост-путь (для books-opener на хосте).
+// Путь обязан лежать внутри корня библиотеки: иначе filepath.Join с ".."
+// позволял бы выйти за пределы смонтированного каталога.
+func toHostPath(containerPath, mediaType string) (string, error) {
+	var containerRoot, hostRoot string
+	switch mediaType {
+	case "tv":
+		containerRoot = platform.GetEnv("MEDIA_TV_DIR", "/tv")
+		hostRoot = platform.GetEnv("MEDIA_TV_HOST_DIR", "/mnt/nas/root/FuzzyHD/TV")
+	case "movie":
+		containerRoot = platform.GetEnv("MEDIA_MOVIES_DIR", "/movies")
+		hostRoot = platform.GetEnv("MEDIA_MOVIES_HOST_DIR", "/mnt/nas/root/FuzzyHD/Movies")
+	default:
+		return "", fmt.Errorf("invalid media type")
 	}
-	hostDir := platform.GetEnv("MEDIA_MOVIES_HOST_DIR", "/mnt/nas/root/FuzzyHD/Movies")
-	rel := strings.TrimPrefix(containerPath, platform.GetEnv("MEDIA_MOVIES_DIR", "/movies"))
-	return filepath.Join(hostDir, rel)
+
+	containerRoot = filepath.Clean(containerRoot)
+	hostRoot = filepath.Clean(hostRoot)
+	if !filepath.IsAbs(containerPath) || !filepath.IsAbs(hostRoot) {
+		return "", fmt.Errorf("path outside library")
+	}
+
+	rel, err := filepath.Rel(containerRoot, filepath.Clean(containerPath))
+	if err != nil || rel == "." || rel == ".." || filepath.IsAbs(rel) ||
+		strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("path outside library")
+	}
+
+	hostPath := filepath.Join(hostRoot, rel)
+	if r, err := filepath.Rel(hostRoot, hostPath); err != nil || r == ".." ||
+		filepath.IsAbs(r) || strings.HasPrefix(r, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("path outside library")
+	}
+	return hostPath, nil
 }
 
 func firstVideoFile(dir string) (string, error) {
+	if !withinRoot(libraryRoot("tv"), dir) {
+		return "", fmt.Errorf("path outside library")
+	}
 	var found string
-	videoExts := map[string]bool{".mkv": true, ".mp4": true, ".avi": true}
 	filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
 		if err != nil || found != "" || d.IsDir() {
 			return nil
 		}
-		if videoExts[strings.ToLower(filepath.Ext(p))] {
-			found = p
+		if isVideoExt(strings.ToLower(filepath.Ext(p))) {
+			if real, err := mediaFilePath(p, "tv"); err == nil {
+				found = real
+			}
 		}
 		return nil
 	})
@@ -3393,7 +3977,11 @@ func resolveMediaFile(id int) (string, string, error) {
 		}
 		return f, mediaType, nil
 	}
-	return p, mediaType, nil
+	real, err := mediaFilePath(p, mediaType)
+	if err != nil {
+		return "", "", err
+	}
+	return real, mediaType, nil
 }
 
 // ============================================================
@@ -3505,8 +4093,30 @@ func probeNVENC() bool {
 	return true
 }
 
+var transcodeSlots = func() chan struct{} {
+	n := 2
+	if v, err := strconv.Atoi(platform.GetEnv("TRANSCODE_MAX_CONCURRENT", "2")); err == nil && v > 0 {
+		n = v
+	}
+	return make(chan struct{}, n)
+}()
+
 func streamTranscoded(c fiber.Ctx, path string) error {
-	args := []string{"-i", path}
+	if !isVideoExt(strings.ToLower(filepath.Ext(path))) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "unsupported file type"})
+	}
+	select {
+	case transcodeSlots <- struct{}{}:
+		defer func() { <-transcodeSlots }()
+	default:
+		return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{"error": "transcoder busy"})
+	}
+
+	args := []string{
+		"-nostdin", "-hide_banner", "-loglevel", "error",
+		"-protocol_whitelist", "file",
+		"-i", path,
+	}
 
 	if platform.GetEnv("TRANSCODE_VIDEO_ENABLED", "true") != "true" {
 		args = append(args, "-c:v", "copy")
@@ -3539,17 +4149,25 @@ func streamTranscoded(c fiber.Ctx, path string) error {
 
 	c.Set("X-Video-Transcode", strconv.FormatBool(needsVideoTranscode(path)))
 
-	cmd := exec.Command("ffmpeg", args...)
+	cmd := exec.CommandContext(c.Context(), "ffmpeg", args...)
+	cmd.WaitDelay = 3 * time.Second
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		return c.Status(500).JSON(fiber.Map{"error": "ffmpeg failed"})
 	}
 	cmd.Stderr = io.Discard
 	if err := cmd.Start(); err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		return c.Status(500).JSON(fiber.Map{"error": "ffmpeg failed"})
 	}
-	go cmd.Wait()
+	defer func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	}()
+
 	c.Set("Content-Type", "video/mp4")
+	c.Set("X-Content-Type-Options", "nosniff")
 	return c.SendStream(stdout)
 }
 
@@ -3600,17 +4218,19 @@ func parseName(name string) (string, int) {
 	title := cleanTitle(name)
 
 	if title == "" {
-		return original, year
+		// original содержит расширение: в title (и в поиск TMDb) попадало
+		// "S01E01.mkv"/"1080p.mkv". Чистим.
+		return stripExtension(original), year
 	}
 	return title, year
 }
 
 func stripExtension(name string) string {
-	switch strings.ToLower(filepath.Ext(name)) {
-	case ".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv":
-		return strings.TrimSuffix(name, filepath.Ext(name))
+	ext := filepath.Ext(name)
+	if !isVideoExt(ext) {
+		return name
 	}
-	return name
+	return strings.TrimSuffix(name, ext)
 }
 
 func cleanTitle(s string) string {
@@ -3763,6 +4383,14 @@ type subSearchResult struct {
 	} `json:"results"`
 }
 
+func safeTorrentRef(s string) bool {
+	if strings.HasPrefix(s, "magnet:?") {
+		return true
+	}
+	u, err := url.Parse(s)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
+}
+
 // subscriptionCheck ищет новые серии и добавляет торренты.
 func subscriptionCheck(id int) ([]string, error) {
 	var seriesID int
@@ -3789,9 +4417,20 @@ func subscriptionCheck(id int) ([]string, error) {
 	searchURL := platform.GetEnv("SEARCH_SERVICE_URL", "http://search-service:8088")
 	torrentURL := platform.GetEnv("TORRENT_SERVICE_URL", "http://torrent-service:8081")
 	added := []string{}
+	maxNext := 0
 
 	for season, maxEp := range seasons {
 		next := maxEp + 1
+
+		// Уже добавленная серия не должна повторно ставиться на загрузку.
+		var exists bool
+		_ = db.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM episodes WHERE series_id=$1 AND season=$2 AND episode=$3)`,
+			seriesID, season, next).Scan(&exists)
+		if exists {
+			continue
+		}
+
 		q := fmt.Sprintf("%s S%02dE%02d", title, season, next)
 		var res subSearchResult
 		u := fmt.Sprintf("%s/search?q=%s&limit=5", strings.TrimRight(searchURL, "/"), url.QueryEscape(q))
@@ -3800,23 +4439,41 @@ func subscriptionCheck(id int) ([]string, error) {
 		}
 		r := res.Results[0]
 		payload := map[string]string{}
-		if r.Magnet != "" {
+		switch {
+		case r.Magnet != "" && safeTorrentRef(r.Magnet):
 			payload["magnet"] = r.Magnet
-		} else if r.DownloadURL != "" {
+		case r.DownloadURL != "" && safeTorrentRef(r.DownloadURL):
 			payload["torrentUrl"] = r.DownloadURL
-		} else {
+		default:
 			continue
 		}
+
 		b, _ := json.Marshal(payload)
 		client := &http.Client{Timeout: 30 * time.Second}
-		resp, perr := client.Post(strings.TrimRight(torrentURL, "/")+"/add", "application/json", strings.NewReader(string(b)))
-		if perr == nil {
-			_ = resp.Body.Close()
-			added = append(added, q)
-			_ = rdb.Publish(ctx, "series.new_episode", fmt.Sprintf("%s S%02dE%02d", title, season, next)).Err()
+		resp, perr := client.Post(strings.TrimRight(torrentURL, "/")+"/add", "application/json", bytes.NewReader(b))
+		if perr != nil {
+			log.Printf("subscription %d: torrent add: %v", id, perr)
+			continue
 		}
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		_ = resp.Body.Close()
+		if resp.StatusCode/100 != 2 {
+			log.Printf("subscription %d: torrent status %d: %s", id, resp.StatusCode, string(respBody))
+			continue
+		}
+
+		added = append(added, q)
+		if next > maxNext {
+			maxNext = next
+		}
+		_, _ = db.Exec(ctx,
+			`UPDATE series_subscriptions SET last_episode=GREATEST(COALESCE(last_episode,0),$2), season=$3 WHERE id=$1`,
+			id, next, season)
+		_ = rdb.Publish(ctx, "series.new_episode", q).Err()
 	}
 
-	_, _ = db.Exec(ctx, `UPDATE series_subscriptions SET last_check=NOW() WHERE id=$1`, id)
+	_, _ = db.Exec(ctx,
+		`UPDATE series_subscriptions SET last_check=NOW(), last_episode=GREATEST(COALESCE(last_episode,0),$2) WHERE id=$1`,
+		id, maxNext)
 	return added, nil
 }

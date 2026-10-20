@@ -3,7 +3,7 @@ services:
     image: docker.io/library/redis:7-alpine
     container_name: nas-redis
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -24,7 +24,7 @@ services:
     image: docker.io/library/postgres:17-alpine
     container_name: nas-postgres
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     environment:
       - POSTGRES_USER=nas
       - POSTGRES_PASSWORD=nas_secret
@@ -52,11 +52,15 @@ services:
       context: .
       dockerfile: auth-service/Dockerfile
     container_name: nas-auth
-    ports:
-      - "8086:8086"
+    # Наружу не публикуется: вход только через gateway (/auth/*).
+    expose:
+      - "8086"
     environment:
-      - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
-      - AUTH_PASSWORD=${AUTH_PASSWORD:-admin}
+      - JWT_SECRET=${JWT_SECRET:-}
+      - AUTH_PASSWORD=${AUTH_PASSWORD:-}
+      - AUTH_ENABLED=${AUTH_ENABLED:-false}
+      - AUTH_TOKEN_TTL=${AUTH_TOKEN_TTL:-168h}
+      - PPROF_ENABLED=${PPROF_ENABLED:-false}
       - POSTGRES_URL=postgres://nas:nas_secret@postgres:5432/nas_history?sslmode=disable
     depends_on:
       postgres:
@@ -125,7 +129,7 @@ services:
       dockerfile: torrent-service/Dockerfile
     container_name: nas-torrent
     ports:
-      - "8081:8081"
+      - "127.0.0.1:8081:8081"
     environment:
       - REDIS_ADDR=redis:6379
       - NAS_HOST=${NAS_HOST:-192.168.0.5}
@@ -166,7 +170,7 @@ services:
       dockerfile: scheduler-service/Dockerfile
     container_name: nas-scheduler
     ports:
-      - "8084:8084"
+      - "127.0.0.1:8084:8084"
     environment:
       - REDIS_ADDR=redis:6379
       - POSTGRES_URL=postgres://nas:nas_secret@postgres:5432/nas_history?sslmode=disable
@@ -187,6 +191,10 @@ services:
       - NAS_SSH_KEY=/root/.ssh/id_ed25519
       - NAS_BACKUP_SCRIPT=${NAS_BACKUP_SCRIPT:-/volume1/docker/gitea-backups/backup-gitea.sh}
       - NAS_PASS=${NAS_PASS:-}
+      # accept-new — TOFU при первом подключении; yes — только с заранее
+      # залитым known_hosts в volume scheduler_ssh.
+      - NAS_STRICT_HOST_KEY=${NAS_STRICT_HOST_KEY:-accept-new}
+      - NAS_KNOWN_HOSTS=/root/.ssh/known_hosts
     volumes:
       - ${BACKUP_HOST_DIR:-/mnt/nas/Backups}:/backups
       # Отдельный ключ scheduler-service; создаётся в named volume.
@@ -221,10 +229,13 @@ services:
       dockerfile: history-service/Dockerfile
     container_name: nas-history
     ports:
-      - "8085:8085"
+      - "127.0.0.1:8085:8085"
     environment:
       - POSTGRES_URL=postgres://nas:nas_secret@postgres:5432/nas_history?sslmode=disable
       - REDIS_ADDR=redis:6379
+      - HISTORY_GATEWAY_TOKEN=${HISTORY_GATEWAY_TOKEN:-}
+      - NOTIFY_GATEWAY_TOKEN=${NOTIFY_GATEWAY_TOKEN:-}
+      - HISTORY_ADMIN_TOKEN=${ADMIN_TOKEN:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -252,8 +263,9 @@ services:
       context: .
       dockerfile: books-service/Dockerfile
     container_name: nas-books
+    # Внутренний API без auth: наружу публикуем только на loopback.
     ports:
-      - "8087:8087"
+      - "127.0.0.1:8087:8087"
     environment:
       - FLIBUSTA_URL=${FLIBUSTA_URL:-https://flibusta.is}
       - FLIBUSTA_LOCAL_URL=${FLIBUSTA_LOCAL_URL:-}
@@ -286,7 +298,7 @@ services:
     extra_hosts:
       - "host.containers.internal:host-gateway"
     ports:
-      - "8088:8088"
+      - "127.0.0.1:8088:8088"
     environment:
       - PROWLARR_URL=http://host.containers.internal:9696
       - PROWLARR_API_KEY=${PROWLARR_API_KEY}
@@ -351,8 +363,9 @@ services:
       context: .
       dockerfile: media-service/Dockerfile
     container_name: nas-media
-    ports:
-      - "8091:8091"
+    # Наружу не публикуем: доступ только через gateway (сеть стека).
+    expose:
+      - "8091"
     environment:
       - POSTGRES_URL=postgres://nas:nas_secret@postgres:5432/nas_history?sslmode=disable
       - REDIS_ADDR=redis:6379
@@ -375,6 +388,7 @@ services:
       - SEARCH_SERVICE_URL=http://search-service:8088
       - TORRENT_SERVICE_URL=http://torrent-service:8081
       - BOOKS_OPENER_URL=http://host.containers.internal:9999
+      - OPENER_TOKEN=${OPENER_TOKEN:-}
       # Тот же ADMIN_TOKEN, что и у host-agent: /duplicates/resolve переносит файлы.
       - ADMIN_TOKEN=${ADMIN_TOKEN:-}
       - HOST_AGENT_URL=http://host.containers.internal:9998
@@ -415,8 +429,9 @@ services:
       context: .
       dockerfile: music-service/Dockerfile
     container_name: nas-music
-    ports:
-      - "8092:8092"
+    # Наружу не публикуем: доступ только через gateway (сеть стека).
+    expose:
+      - "8092"
     environment:
       - MPD_ADDR=${MPD_ADDR:-host.containers.internal:6600}
       - MUSIC_DIR=${MUSIC_HOST_DIR:-/mnt/nas/root/FuzzyHD/Music}
@@ -475,6 +490,7 @@ services:
       - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
       - AUTH_ENABLED=${AUTH_ENABLED:-false}
       - NOTIFY_GATEWAY_TOKEN=${NOTIFY_GATEWAY_TOKEN:-}
+      - HISTORY_GATEWAY_TOKEN=${HISTORY_GATEWAY_TOKEN:-}
       # ADMIN_TOKEN: без него gateway ПАДАЕТ на старте — host-exec ручки
       # (/notify/update/*, /notify/env*, /scheduler/update/*) закрыты.
       - ADMIN_TOKEN=${ADMIN_TOKEN:-}
@@ -513,6 +529,8 @@ services:
     environment:
       - GATEWAY_URL=http://gateway:8080
       - SCHEDULER_URL=http://scheduler-service:8084
+      # Prowlarr auto-setup → scheduler /prowlarr/setup (закрыт ADMIN_TOKEN).
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
       - ENV_PATH=/app/.env
       - SETUP_AUTO_REDIRECT=${SETUP_AUTO_REDIRECT:-false}
       - NAS_TYPE=${NAS_TYPE:-generic-linux}
@@ -662,10 +680,21 @@ services:
       context: .
       dockerfile: books-opener/Dockerfile
     container_name: nas-books-opener-docker
+    # Наружу только loopback: JS дашборда ходит на localhost:9999.
     ports:
-      - "9999:9999"
+      - "127.0.0.1:9999:9999"
     environment:
-      - LIBRARY_ROOT=${LIBRARY_ROOT:-/mnt/nas/root/FuzzyHD}
+      - OPENER_BIND=0.0.0.0:9999
+      # Браузер не знает токен, поэтому по умолчанию пуст; perimeter — loopback
+      # + обязательный X-Opener/Origin. Для сервис-сервис задайте OPENER_TOKEN
+      # (и тот же токен media-service).
+      - OPENER_TOKEN=${OPENER_TOKEN:-}
+      - OPENER_ALLOW_ANONYMOUS=true
+      - OPENER_ORIGINS=${OPENER_ORIGINS:-http://localhost:8090,http://127.0.0.1:8090}
+      - BOOKS_DIR=/mnt/nas/Books
+      - YT_DIR=/mnt/nas/YT_video
+      - MEDIA_MOVIES_HOST_DIR=${MEDIA_MOVIES_HOST_DIR:-/mnt/nas/root/FuzzyHD/Movies}
+      - MEDIA_TV_HOST_DIR=${MEDIA_TV_HOST_DIR:-/mnt/nas/root/FuzzyHD/TV}
     volumes:
       - ${NAS_ROOT:-/mnt/nas}:/mnt/nas:ro
     restart: unless-stopped

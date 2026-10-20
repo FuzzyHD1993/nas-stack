@@ -3,25 +3,33 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/FuzzyHD1993/nas-stack/internal/platform"
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/middleware/adaptor"
+	fiberrecover "github.com/gofiber/fiber/v3/middleware/recover"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
@@ -34,13 +42,26 @@ var (
 )
 
 // bitPerfectEnabled — показывать ли bit-perfect индикатор (для EasyEffects/EQ выключают).
-var bitPerfectEnabled = true
+// atomic: читается из HTTP-хендлеров, playTracker и тестов.
+var bitPerfectEnabled atomic.Bool
+
+func init() { bitPerfectEnabled.Store(true) }
 
 // mpdClient — минимальный клиент MPD поверх TCP.
 type mpdClient struct {
-	conn net.Conn
-	mu   sync.Mutex
-	r    *bufio.Reader
+	conn   net.Conn
+	mu     sync.Mutex
+	r      *bufio.Reader
+	closed atomic.Bool
+}
+
+// close идемпотентен и не требует mu: он «будит» активный I/O.
+func (c *mpdClient) close() {
+	if c.closed.Swap(true) {
+		return
+	}
+	_ = c.conn.SetDeadline(time.Now())
+	_ = c.conn.Close()
 }
 
 func dialMPD(addr string) (*mpdClient, error) {
@@ -56,19 +77,22 @@ func dialMPD(addr string) (*mpdClient, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Дедлайн только на установку сессии (ping), долгие команды raw() не ограничиваем.
-	conn.SetDeadline(time.Now().Add(3 * time.Second))
 	c := &mpdClient{conn: conn, r: bufio.NewReader(conn)}
-	_, err = c.raw("ping")
-	if err != nil {
-		conn.Close()
+	if _, err := c.rawTimeout(3*time.Second, "ping"); err != nil {
+		c.close()
 		return nil, err
 	}
-	conn.SetDeadline(time.Time{})
 	return c, nil
 }
 
 func mpdQuote(s string) string {
+	// MPD читает команды построчно: \n/\r — это инъекция новой команды.
+	s = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == 0 {
+			return -1
+		}
+		return r
+	}, s)
 	if s == "" {
 		return `""`
 	}
@@ -80,7 +104,36 @@ func mpdQuote(s string) string {
 	return `"` + s + `"`
 }
 
+// defaultMPDTimeout — верхняя граница любой команды MPD: зависший MPD не
+// должен навсегда удерживать c.mu (и все последующие запросы).
+const defaultMPDTimeout = 15 * time.Second
+
 func (c *mpdClient) raw(cmd string, args ...string) ([]string, error) {
+	return c.rawTimeout(defaultMPDTimeout, cmd, args...)
+}
+
+// rawTimeout — raw с дедлайном на весь обмен. При ошибке соединение
+// закрывается: иначе в bufio.Reader остаётся недочитанный хвост ответа, и
+// следующая команда читает чужие строки (десинхронизация протокола MPD).
+func (c *mpdClient) rawTimeout(timeout time.Duration, cmd string, args ...string) ([]string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed.Load() {
+		return nil, fmt.Errorf("mpd: connection closed")
+	}
+	if err := c.conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		c.close()
+		return nil, err
+	}
+	defer func() { _ = c.conn.SetDeadline(time.Time{}) }()
+	return c.exchange(cmd, args...)
+}
+
+func (c *mpdClient) exchange(cmd string, args ...string) ([]string, error) {
+	if c.closed.Load() {
+		return nil, fmt.Errorf("mpd: connection closed")
+	}
 	line := cmd
 	if len(args) > 0 {
 		quoted := make([]string, 0, len(args))
@@ -89,15 +142,16 @@ func (c *mpdClient) raw(cmd string, args ...string) ([]string, error) {
 		}
 		line += " " + strings.Join(quoted, " ")
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+
 	if _, err := fmt.Fprintf(c.conn, "%s\n", line); err != nil {
+		c.close()
 		return nil, err
 	}
 	var out []string
 	for {
 		l, err := c.r.ReadString('\n')
 		if err != nil {
+			c.close()
 			return nil, err
 		}
 		l = strings.TrimRight(l, "\r\n")
@@ -185,12 +239,15 @@ var (
 	mpdMu      sync.Mutex
 	mpd        *mpdClient
 	dialMu     sync.Mutex // сериализует переподключение (один конкурентный диал)
-	mpdDownFor time.Time // backoff после неудачного диала, защита от thundering herd (под dialMu)
+	mpdDownFor time.Time  // backoff после неудачного диала, защита от thundering herd (под dialMu)
 )
 
 // pingTimeout проверяет живость соединения с жёстким дедлайном.
 // Не требует mpdMu; сериализуется собственным mu клиента.
 func (c *mpdClient) pingTimeout(d time.Duration) bool {
+	if c.closed.Load() {
+		return false
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	_ = c.conn.SetDeadline(time.Now().Add(d))
@@ -224,7 +281,7 @@ func mpdReachable(addr string) bool {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(1 * time.Second))
 	c := &mpdClient{conn: conn, r: bufio.NewReader(conn)}
-	_, err = c.raw("ping")
+	_, err = c.rawTimeout(1*time.Second, "ping")
 	return err == nil
 }
 
@@ -235,7 +292,7 @@ func getMPD() (*mpdClient, error) {
 	mpdMu.Lock()
 	c := mpd
 	mpdMu.Unlock()
-	if c != nil && c.pingTimeout(2*time.Second) {
+	if c != nil && !c.closed.Load() && c.pingTimeout(2*time.Second) {
 		return c, nil
 	}
 	dialMu.Lock()
@@ -244,7 +301,7 @@ func getMPD() (*mpdClient, error) {
 	mpdMu.Lock()
 	c = mpd
 	mpdMu.Unlock()
-	if c != nil && c.pingTimeout(2*time.Second) {
+	if c != nil && !c.closed.Load() && c.pingTimeout(2*time.Second) {
 		return c, nil
 	}
 	if time.Now().Before(mpdDownFor) {
@@ -256,7 +313,7 @@ func getMPD() (*mpdClient, error) {
 			mpd = nil
 		}
 		mpdMu.Unlock()
-		c.conn.Close()
+		c.close()
 	}
 	nc, err := dialMPD(platform.GetEnv("MPD_ADDR", "host.containers.internal:6600"))
 	if err != nil {
@@ -310,7 +367,7 @@ func mpdStatus() fiber.Map {
 		raw[f.key] = f.val
 	}
 	st["audio"] = parseAudioInfo(songFile, raw)
-	st["audio_chain_enabled"] = bitPerfectEnabled
+	st["audio_chain_enabled"] = bitPerfectEnabled.Load()
 	st["mpd"] = "connected"
 	return st
 }
@@ -332,14 +389,67 @@ type AudioInfo struct {
 	OutputDevice string `json:"output_device"`
 }
 
+type probeResult struct {
+	rate, bits int
+	codec      string
+	exp        time.Time
+}
+
+var (
+	probeMu    sync.RWMutex
+	probeCache = map[string]probeResult{}
+)
+
+const probeTTL = 10 * time.Minute
+
 // probeSourceAudio читает частоту/битность исходного файла через ffprobe.
-func probeSourceAudio(path string) (rate, bits int, codec string) {
-	if path == "" {
+// Путь приходит из MPD, поэтому нормализуется внутри MUSIC_DIR: ffprobe не
+// получает URL, опцию или путь вне библиотеки. Результат кэшируется: /status
+// опрашивается часто, а запуск процесса на каждый запрос недопустим.
+func probeSourceAudio(songFile string) (rate, bits int, codec string) {
+	if songFile == "" {
 		return 0, 0, ""
 	}
-	out, err := exec.Command("ffprobe", "-v", "error", "-select_streams", "a:0",
+	rel, ok := relMusicPath(songFile)
+	if !ok {
+		return 0, 0, ""
+	}
+	p, ok := safeMusicFile(rel)
+	if !ok {
+		return 0, 0, ""
+	}
+
+	key := p
+	if fi, err := os.Stat(p); err == nil {
+		key = fmt.Sprintf("%s|%d|%d", p, fi.Size(), fi.ModTime().UnixNano())
+	}
+	probeMu.RLock()
+	pr, ok := probeCache[key]
+	probeMu.RUnlock()
+	if ok && time.Now().Before(pr.exp) {
+		return pr.rate, pr.bits, pr.codec
+	}
+
+	rate, bits, codec = runFFprobe(p)
+	probeMu.Lock()
+	if len(probeCache) > 4096 {
+		probeCache = map[string]probeResult{}
+	}
+	probeCache[key] = probeResult{rate: rate, bits: bits, codec: codec, exp: time.Now().Add(probeTTL)}
+	probeMu.Unlock()
+	return rate, bits, codec
+}
+
+func runFFprobe(p string) (rate, bits int, codec string) {
+	cctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(cctx, "ffprobe",
+		"-v", "error",
+		"-protocol_whitelist", "file", // только локальные файлы: без http/tcp/concat
+		"-select_streams", "a:0",
 		"-show_entries", "stream=sample_rate,bits_per_raw_sample,bits_per_sample,codec_name",
-		"-of", "default=noprint_wrappers=1", path).Output()
+		"-of", "default=noprint_wrappers=1",
+		"file:"+p).Output()
 	if err != nil {
 		return 0, 0, ""
 	}
@@ -372,6 +482,16 @@ func parseAudioInfo(songFile string, status map[string]string) AudioInfo {
 			info.Channels, _ = strconv.Atoi(parts[2])
 		}
 	}
+	// MPD — внешний процесс: абсурдные значения не должны попадать в расчёты.
+	if info.SampleRate < 0 || info.SampleRate > 4_000_000 {
+		info.SampleRate = 0
+	}
+	if info.Bits < 0 || info.Bits > 64 {
+		info.Bits = 0
+	}
+	if info.Channels < 0 || info.Channels > 64 {
+		info.Channels = 0
+	}
 	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(songFile), "."))
 	if ext != "" {
 		info.Codec = ext
@@ -380,6 +500,9 @@ func parseAudioInfo(songFile string, status map[string]string) AudioInfo {
 		info.BitrateKbps, _ = strconv.Atoi(br)
 	} else if info.SampleRate > 0 && info.Bits > 0 {
 		info.BitrateKbps = info.SampleRate * info.Bits * info.Channels / 1000
+	}
+	if info.BitrateKbps < 0 || info.BitrateKbps > 100_000 {
+		info.BitrateKbps = 0
 	}
 	codecUpper := strings.ToUpper(info.Codec)
 	switch {
@@ -405,7 +528,7 @@ func parseAudioInfo(songFile string, status map[string]string) AudioInfo {
 	}
 
 	// Если индикатор выключен — не вызываем ffprobe и не считаем bit-perfect.
-	if !bitPerfectEnabled {
+	if !bitPerfectEnabled.Load() {
 		return info
 	}
 
@@ -443,7 +566,7 @@ func albumList() ([]fiber.Map, error) {
 	if err != nil {
 		return nil, err
 	}
-	lines, err := c.raw("list", "Album", "group", "AlbumArtist")
+	lines, err := c.rawTimeout(60*time.Second, "list", "Album", "group", "AlbumArtist")
 	if err != nil {
 		return nil, err
 	}
@@ -457,7 +580,11 @@ func albumList() ([]fiber.Map, error) {
 			if alb == "" || cur == "" {
 				continue
 			}
-			albums = append(albums, fiber.Map{"artist": cur, "album": alb, "cover_url": "/api/music/covers/" + cur + "/" + alb})
+			albums = append(albums, fiber.Map{
+				"artist":    cur,
+				"album":     alb,
+				"cover_url": "/api/music/covers/" + url.PathEscape(cur) + "/" + url.PathEscape(alb),
+			})
 		}
 	}
 	sort.Slice(albums, func(i, j int) bool {
@@ -539,6 +666,32 @@ func getAlbumsSorted(sortParam string) ([]fiber.Map, error) {
 	return albums, nil
 }
 
+// trackNo безопасно достаёт номер трека: тега может не быть вовсе.
+func trackNo(m fiber.Map) int {
+	switch v := m["track"].(type) {
+	case string:
+		if i := strings.IndexByte(v, '/'); i > 0 {
+			v = v[:i]
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil || n < 0 {
+			return 0
+		}
+		return n
+	case float64:
+		if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+			return 0
+		}
+		return int(v)
+	case int:
+		if v < 0 {
+			return 0
+		}
+		return v
+	}
+	return 0
+}
+
 func albumTracks(artist, album string) ([]fiber.Map, error) {
 	key := "music:tracks:" + url.QueryEscape(artist) + ":" + url.QueryEscape(album)
 	var cached []fiber.Map
@@ -550,7 +703,12 @@ func albumTracks(artist, album string) ([]fiber.Map, error) {
 		return nil, err
 	}
 	lines, err := c.raw("find", "Album", album, "AlbumArtist", artist)
-	if err != nil || len(lines) == 0 {
+	if err != nil {
+		return nil, err
+	}
+	// Fallback без артиста только если артист не задан: иначе можно вернуть
+	// и закэшировать треки одноимённого альбома другого артиста.
+	if len(lines) == 0 && strings.TrimSpace(artist) == "" {
 		lines, err = c.raw("find", "Album", album)
 		if err != nil {
 			return nil, err
@@ -591,34 +749,77 @@ func albumTracks(artist, album string) ([]fiber.Map, error) {
 		}
 	}
 	flush()
-	sort.Slice(tracks, func(i, j int) bool {
-		ti, _ := strconv.Atoi(tracks[i]["track"].(string))
-		tj, _ := strconv.Atoi(tracks[j]["track"].(string))
-		return ti < tj
+	sort.SliceStable(tracks, func(i, j int) bool {
+		return trackNo(tracks[i]) < trackNo(tracks[j])
 	})
 	cacheSetJSON(key, tracks, tracksCacheTTL)
 	return tracks, nil
 }
 
 func playAlbum(artist, album string) error {
-	c, err := getMPD()
+	artist, album = strings.TrimSpace(artist), strings.TrimSpace(album)
+	if artist == "" || album == "" {
+		return fmt.Errorf("artist and album required")
+	}
+	m, err := getMPD()
 	if err != nil {
 		return err
 	}
-	tracks, _ := albumTracks(artist, album)
-	c.exec("clear")
+	tracks, err := albumTracks(artist, album)
+	if err != nil {
+		return err
+	}
+	files := make([]string, 0, len(tracks))
 	for _, t := range tracks {
-		if f, ok := t["file"].(string); ok {
-			c.exec("add", f)
+		if f, ok := t["file"].(string); ok && f != "" {
+			files = append(files, f)
 		}
 	}
-	return c.exec("play")
+	if len(files) == 0 {
+		return fmt.Errorf("album not found")
+	}
+	_, err = replaceQueueAndPlay(m, files)
+	return err
 }
 
 func coverFile(artist, album string) string {
 	// Полный поиск: файл в папке альбома (30+ имён + рекурсия) → встроенная
 	// обложка через ffmpeg. Реализация в covers.go.
 	return coverFor(artist, album)
+}
+
+// coverParam декодирует сегмент пути. PathUnescape, а не QueryUnescape:
+// '+' в названии не должен превращаться в пробел.
+func coverParam(c fiber.Ctx, key string) (string, bool) {
+	s, err := url.PathUnescape(c.Params(key))
+	if err != nil {
+		return "", false
+	}
+	s = strings.TrimSpace(s)
+	if s == "" || len(s) > 256 {
+		return "", false
+	}
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return "", false
+		}
+	}
+	return s, true
+}
+
+// validPlaylistName — MPD пишет плейлист в playlist_directory на хосте,
+// поэтому разделители пути и управляющие символы недопустимы.
+func validPlaylistName(s string) bool {
+	if s == "" || len([]rune(s)) > 128 || s == "." || s == ".." ||
+		strings.ContainsAny(s, "/\\\r\n\x00") || strings.Contains(s, "..") {
+		return false
+	}
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 func mpdSearch(q string) []fiber.Map {
@@ -667,6 +868,10 @@ var playStats = struct {
 	tracks  map[string]int
 }{artists: map[string]int{}, tracks: map[string]int{}}
 
+// maxPlayStats ограничивает кардинальность: интернет-радио и потоковые теги
+// иначе растят map без предела до OOM.
+const maxPlayStats = 20000
+
 // playTracker отслеживает смену трека и ведёт статистику прослушивания.
 func playTracker() {
 	last := ""
@@ -676,47 +881,64 @@ func playTracker() {
 	prevFile := ""
 	var prevElapsed, prevDuration float64
 	for {
-		if m, err := getMPD(); err == nil {
-			st := fieldsToMap(m.fields("status"))
-			cur := fieldsToMap(m.fields("currentsong"))
-			artist, _ := cur["artist"].(string)
-			title, _ := cur["title"].(string)
-			file, _ := cur["file"].(string)
-			alb, _ := cur["album"].(string)
-			duration, _ := strconv.ParseFloat(fmt.Sprint(st["duration"]), 64)
-			elapsed, _ := strconv.ParseFloat(fmt.Sprint(st["elapsed"]), 64)
-			state, _ := st["state"].(string)
-			// Автопереход: альбом доиграл (play → stop у самого конца трека).
-			if lastState == "play" && state == "stop" && prevFile != "" &&
-				prevDuration > 0 && prevElapsed >= prevDuration-5 {
-				autoNextAlbum(m, prevFile)
+		m, err := getMPD()
+		if err != nil {
+			// MPD недоступен — это не «альбом доиграл». Сброс обязателен,
+			// иначе после реконнекта возможен ложный автопереход и clear очереди.
+			lastState, prevFile = "", ""
+			prevElapsed, prevDuration = 0, 0
+			time.Sleep(10 * time.Second)
+			continue
+		}
+		st := fieldsToMap(m.fields("status"))
+		cur := fieldsToMap(m.fields("currentsong"))
+		artist, _ := cur["artist"].(string)
+		title, _ := cur["title"].(string)
+		file, _ := cur["file"].(string)
+		alb, _ := cur["album"].(string)
+		duration, _ := strconv.ParseFloat(fmt.Sprint(st["duration"]), 64)
+		elapsed, _ := strconv.ParseFloat(fmt.Sprint(st["elapsed"]), 64)
+		state, _ := st["state"].(string)
+		// Автопереход: альбом доиграл (play → stop у самого конца трека).
+		// Ручной /stop и repeat/single не считаются концом альбома.
+		if lastState == "play" && state == "stop" && prevFile != "" &&
+			prevDuration > 0 && prevElapsed >= prevDuration-2 &&
+			st["repeat"] != "1" && st["single"] != "1" && autoNextAllowed() {
+			autoNextAlbum(m, prevFile)
+		}
+		key := file
+		if key == "" {
+			last = ""
+		}
+		if key != "" && key != last {
+			// Завершаем предыдущую запись, если отыграла >=90%. Нулевой id
+			// (дубль/служебный файл) не должен затирать lastID.
+			if id := recordListen(file, artist, alb, title, duration, lastID, lastElapsed, lastDuration); id > 0 {
+				lastID = id
 			}
-			key := file
-			if key != "" && key != last {
-				// Завершаем предыдущую запись, если отыграла >=90%.
-				lastID = recordListen(file, artist, alb, title, duration, lastID, lastElapsed, lastDuration)
-				last = key
-				playStats.Lock()
+			last = key
+			playStats.Lock()
+			if len(playStats.tracks) < maxPlayStats && len(playStats.artists) < maxPlayStats {
 				if title != "" {
 					playStats.tracks[artist+" — "+title]++
 				}
 				if artist != "" {
 					playStats.artists[artist]++
 				}
-				playStats.Unlock()
-				if rdb != nil {
-					artist = strings.ToValidUTF8(artist, "?")
-					title = strings.ToValidUTF8(title, "?")
-					alb = strings.ToValidUTF8(alb, "?")
-					payload, _ := json.Marshal(fiber.Map{"artist": artist, "title": title, "album": alb, "file": file})
-					_ = rdb.Publish(ctx, "music.played", string(payload)).Err()
-				}
 			}
-			lastElapsed, lastDuration = elapsed, duration
-			lastState = state
-			prevFile = file
-			prevElapsed, prevDuration = elapsed, duration
+			playStats.Unlock()
+			if rdb != nil {
+				artist = strings.ToValidUTF8(artist, "?")
+				title = strings.ToValidUTF8(title, "?")
+				alb = strings.ToValidUTF8(alb, "?")
+				payload, _ := json.Marshal(fiber.Map{"artist": artist, "title": title, "album": alb, "file": file})
+				_ = rdb.Publish(ctx, "music.played", string(payload)).Err()
+			}
 		}
+		lastElapsed, lastDuration = elapsed, duration
+		lastState = state
+		prevFile = file
+		prevElapsed, prevDuration = elapsed, duration
 		time.Sleep(10 * time.Second)
 	}
 }
@@ -741,6 +963,23 @@ func topN(m map[string]int, n int) []fiber.Map {
 	return out
 }
 
+// lyricsHTTP — общий клиент: keep-alive вместо Transport на каждый запрос.
+var lyricsHTTP = &http.Client{Timeout: 10 * time.Second}
+
+const maxLyricsBody = 512 << 10
+
+func lyricsCacheKey(artist, track string) string {
+	sum := sha256.Sum256([]byte(artist + "\x00" + track))
+	return "lyrics:v2:" + hex.EncodeToString(sum[:])
+}
+
+// progressKey хэширует путь: произвольный file_path не должен создавать
+// неограниченное число ключей в Redis.
+func progressKey(fp string) string {
+	sum := sha256.Sum256([]byte(fp))
+	return "music:progress:" + hex.EncodeToString(sum[:])
+}
+
 func main() {
 	if err := platform.ValidateEnv([]string{"POSTGRES_URL"}); err != nil {
 		log.Fatalf("❌ %v", err)
@@ -756,7 +995,7 @@ func main() {
 		// при недоступном Redis висит ~13 c вместо гарантии «~1 c на попытку».
 		DialerRetries: 1,
 	})
-	bitPerfectEnabled = platform.GetEnv("BIT_PERFECT_ENABLED", "true") == "true"
+	bitPerfectEnabled.Store(platform.GetEnv("BIT_PERFECT_ENABLED", "true") == "true")
 	if pgURL := platform.GetEnv("POSTGRES_URL", ""); pgURL != "" {
 		if p, err := pgxpool.New(ctx, pgURL); err != nil {
 			log.Printf("⚠️ PostgreSQL: %v (история прослушиваний недоступна)", err)
@@ -776,9 +1015,16 @@ func main() {
 		musicIndex()
 		getArtistIndex()
 	}()
-	app := fiber.New()
+	app := fiber.New(fiber.Config{
+		ReadTimeout: 10 * time.Second,
+		IdleTimeout: 60 * time.Second,
+		BodyLimit:   1 << 20,
+	})
 	platform.StartPprof()
+	// metrics СНАРУЖИ recover: recover превращает панику в error, и только
+	// тогда metricsMiddleware видит 500, а не 200.
 	app.Use(metricsMiddleware())
+	app.Use(fiberrecover.New())
 
 	app.Get("/metrics", adaptor.HTTPHandler(promhttp.Handler()))
 
@@ -802,7 +1048,7 @@ func main() {
 
 	// Цепочка аудио: источник → выход (bit-perfect индикатор)
 	app.Get("/audio/chain", func(c fiber.Ctx) error {
-		if !bitPerfectEnabled {
+		if !bitPerfectEnabled.Load() {
 			return c.JSON(fiber.Map{"enabled": false})
 		}
 		st := mpdStatus()
@@ -829,27 +1075,26 @@ func main() {
 		})
 	})
 
-	app.Post("/play", func(c fiber.Ctx) error { mpdExec("play"); return c.JSON(fiber.Map{"status": "ok"}) })
-	app.Post("/pause", func(c fiber.Ctx) error { mpdExec("pause"); return c.JSON(fiber.Map{"status": "ok"}) })
-	app.Post("/stop", func(c fiber.Ctx) error { mpdExec("stop"); return c.JSON(fiber.Map{"status": "ok"}) })
+	app.Post("/play", func(c fiber.Ctx) error { return mpdOK(c, "play") })
+	app.Post("/pause", func(c fiber.Ctx) error { return mpdOK(c, "pause") })
+	app.Post("/stop", func(c fiber.Ctx) error { markManualStop(); return mpdOK(c, "stop") })
 	app.Post("/next", func(c fiber.Ctx) error {
 		m, err := getMPD()
 		if err != nil {
-			return c.Status(503).JSON(fiber.Map{"status": "error", "error": err.Error()})
+			return c.Status(503).JSON(fiber.Map{"status": "error", "error": "mpd unavailable"})
 		}
 		// Если следующий трек отсутствует (одиночный файл в очереди) —
 		// догружаем остальные треки его папки, чтобы next не уходил в stop.
 		ensureNextTrack(m)
 		_ = m.exec("next")
-		time.Sleep(150 * time.Millisecond)
 		if state, _ := mpdStatus()["state"].(string); state != "play" {
 			_ = m.exec("play")
 		}
 		return c.JSON(fiber.Map{"status": "ok"})
 	})
-	app.Post("/prev", func(c fiber.Ctx) error { mpdExec("previous"); return c.JSON(fiber.Map{"status": "ok"}) })
-	app.Post("/clear", func(c fiber.Ctx) error { mpdExec("clear"); return c.JSON(fiber.Map{"status": "ok"}) })
-	app.Post("/shuffle", func(c fiber.Ctx) error { mpdExec("shuffle"); return c.JSON(fiber.Map{"status": "ok"}) })
+	app.Post("/prev", func(c fiber.Ctx) error { return mpdOK(c, "previous") })
+	app.Post("/clear", func(c fiber.Ctx) error { return mpdOK(c, "clear") })
+	app.Post("/shuffle", func(c fiber.Ctx) error { return mpdOK(c, "shuffle") })
 
 	app.Post("/volume", func(c fiber.Ctx) error {
 		var b struct {
@@ -858,8 +1103,10 @@ func main() {
 		if err := c.Bind().JSON(&b); err != nil {
 			return c.Status(400).JSON(fiber.Map{"error": "invalid body"})
 		}
-		mpdExec("setvol", strconv.Itoa(b.Level))
-		return c.JSON(fiber.Map{"status": "ok"})
+		if b.Level < 0 || b.Level > 100 {
+			return c.Status(400).JSON(fiber.Map{"error": "level must be 0..100"})
+		}
+		return mpdOK(c, "setvol", strconv.Itoa(b.Level))
 	})
 
 	app.Post("/seek", func(c fiber.Ctx) error {
@@ -869,34 +1116,39 @@ func main() {
 		if err := c.Bind().JSON(&b); err != nil {
 			return c.Status(400).JSON(fiber.Map{"error": "invalid body"})
 		}
-		mpdExec("seekcur", strconv.FormatFloat(b.Position, 'f', 1, 64))
-		return c.JSON(fiber.Map{"status": "ok"})
+		if math.IsNaN(b.Position) || math.IsInf(b.Position, 0) ||
+			b.Position < 0 || b.Position > 24*3600 {
+			return c.Status(400).JSON(fiber.Map{"error": "invalid position"})
+		}
+		return mpdOK(c, "seekcur", strconv.FormatFloat(b.Position, 'f', 1, 64))
 	})
 
 	app.Post("/repeat", func(c fiber.Ctx) error {
 		var b struct {
 			Enabled bool `json:"enabled"`
 		}
-		c.Bind().JSON(&b)
-		if b.Enabled {
-			mpdExec("repeat", "1")
-		} else {
-			mpdExec("repeat", "0")
+		if err := c.Bind().JSON(&b); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "invalid body"})
 		}
-		return c.JSON(fiber.Map{"status": "ok"})
+		v := "0"
+		if b.Enabled {
+			v = "1"
+		}
+		return mpdOK(c, "repeat", v)
 	})
 
 	app.Post("/random", func(c fiber.Ctx) error {
 		var b struct {
 			Enabled bool `json:"enabled"`
 		}
-		c.Bind().JSON(&b)
-		if b.Enabled {
-			mpdExec("random", "1")
-		} else {
-			mpdExec("random", "0")
+		if err := c.Bind().JSON(&b); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "invalid body"})
 		}
-		return c.JSON(fiber.Map{"status": "ok"})
+		v := "0"
+		if b.Enabled {
+			v = "1"
+		}
+		return mpdOK(c, "random", v)
 	})
 
 	app.Get("/playlists", func(c fiber.Ctx) error {
@@ -915,14 +1167,25 @@ func main() {
 	})
 
 	app.Post("/playlist/:name/play", func(c fiber.Ctx) error {
-		name := c.Params("name")
+		name, err := url.PathUnescape(c.Params("name"))
+		if err != nil || !validPlaylistName(name) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid playlist name"})
+		}
 		m, err := getMPD()
 		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+			return c.Status(503).JSON(fiber.Map{"error": "mpd unavailable"})
 		}
-		m.exec("clear")
-		m.exec("load", name)
-		m.exec("play")
+		queueMu.Lock()
+		defer queueMu.Unlock()
+		if err := m.exec("clear"); err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "queue update failed"})
+		}
+		if err := m.exec("load", name); err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "queue update failed"})
+		}
+		if err := m.exec("play"); err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "play failed"})
+		}
 		return c.JSON(fiber.Map{"status": "ok"})
 	})
 
@@ -942,42 +1205,35 @@ func main() {
 		if err := c.Bind().JSON(&b); err != nil || b.File == "" {
 			return c.Status(400).JSON(fiber.Map{"error": "file required"})
 		}
+		rel, ok := relMusicPath(b.File)
+		if !ok {
+			return c.Status(400).JSON(fiber.Map{"error": "invalid file path"})
+		}
 		m, err := getMPD()
 		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+			return c.Status(503).JSON(fiber.Map{"error": "mpd unavailable"})
 		}
-		if err := m.exec("add", b.File); err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		if err := m.exec("add", rel); err != nil {
+			return c.Status(502).JSON(fiber.Map{"error": "add failed"})
 		}
 		return c.JSON(fiber.Map{"status": "ok"})
 	})
 	app.Post("/queue/clear", func(c fiber.Ctx) error {
-		m, err := getMPD()
-		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
-		}
-		m.exec("clear")
-		return c.JSON(fiber.Map{"status": "ok"})
+		return mpdOK(c, "clear")
 	})
 	app.Delete("/queue/:id", func(c fiber.Ctx) error {
-		id := c.Params("id")
-		m, err := getMPD()
-		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		id, err := strconv.Atoi(c.Params("id"))
+		if err != nil || id < 0 {
+			return c.Status(400).JSON(fiber.Map{"error": "invalid id"})
 		}
-		m.exec("deleteid", id)
-		return c.JSON(fiber.Map{"status": "ok"})
+		return mpdOK(c, "deleteid", strconv.Itoa(id))
 	})
 	app.Post("/queue/play/:id", func(c fiber.Ctx) error {
-		id := c.Params("id")
-		m, err := getMPD()
-		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		id, err := strconv.Atoi(c.Params("id"))
+		if err != nil || id < 0 {
+			return c.Status(400).JSON(fiber.Map{"error": "invalid id"})
 		}
-		if err := m.exec("playid", id); err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
-		}
-		return c.JSON(fiber.Map{"status": "ok"})
+		return mpdOK(c, "playid", strconv.Itoa(id))
 	})
 
 	// Сохранённые плейлисты
@@ -1000,87 +1256,136 @@ func main() {
 			Name  string   `json:"name"`
 			Files []string `json:"files"`
 		}
-		if err := c.Bind().JSON(&b); err != nil || b.Name == "" {
-			return c.Status(400).JSON(fiber.Map{"error": "name required"})
+		if err := c.Bind().JSON(&b); err != nil || !validPlaylistName(b.Name) {
+			return c.Status(400).JSON(fiber.Map{"error": "valid name required"})
+		}
+		if len(b.Files) > 5000 {
+			return c.Status(400).JSON(fiber.Map{"error": "too many files"})
+		}
+		relFiles := make([]string, 0, len(b.Files))
+		for _, f := range b.Files {
+			if f == "" {
+				continue
+			}
+			rel, ok := relMusicPath(f)
+			if !ok {
+				return c.Status(400).JSON(fiber.Map{"error": "invalid file path"})
+			}
+			relFiles = append(relFiles, rel)
 		}
 		m, err := getMPD()
 		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+			return c.Status(503).JSON(fiber.Map{"error": "mpd unavailable"})
 		}
 		if len(b.Files) > 0 {
 			// Создаём плейлист из переданных файлов
-			m.exec("playlistclear", b.Name)
-			for _, f := range b.Files {
-				if f != "" {
-					m.exec("playlistadd", b.Name, f)
-				}
+			if err := m.exec("playlistclear", b.Name); err != nil {
+				return c.Status(502).JSON(fiber.Map{"error": "playlist update failed"})
 			}
-			return c.JSON(fiber.Map{"status": "ok", "count": len(b.Files)})
+			added := 0
+			for _, f := range relFiles {
+				if err := m.exec("playlistadd", b.Name, f); err != nil {
+					log.Printf("playlistadd %q %q: %v", b.Name, f, err)
+					continue
+				}
+				added++
+			}
+			return c.JSON(fiber.Map{"status": "ok", "count": added})
 		}
 		if err := m.exec("save", b.Name); err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+			log.Printf("playlist save %q: %v", b.Name, err)
+			return c.Status(502).JSON(fiber.Map{"error": "playlist save failed"})
 		}
 		return c.JSON(fiber.Map{"status": "ok"})
 	})
 	app.Post("/saved-playlists/:name/play", func(c fiber.Ctx) error {
-		name, _ := url.QueryUnescape(c.Params("name"))
+		name, err := url.PathUnescape(c.Params("name"))
+		if err != nil || !validPlaylistName(name) {
+			return c.Status(400).JSON(fiber.Map{"error": "invalid playlist name"})
+		}
 		m, err := getMPD()
 		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+			return c.Status(503).JSON(fiber.Map{"error": "mpd unavailable"})
 		}
-		m.exec("clear")
-		m.exec("load", name)
-		m.exec("play")
+		queueMu.Lock()
+		defer queueMu.Unlock()
+		if err := m.exec("clear"); err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "queue update failed"})
+		}
+		if err := m.exec("load", name); err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "queue update failed"})
+		}
+		if err := m.exec("play"); err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "play failed"})
+		}
 		return c.JSON(fiber.Map{"status": "ok"})
 	})
 	app.Get("/saved-playlists/:name", func(c fiber.Ctx) error {
-		name, _ := url.QueryUnescape(c.Params("name"))
+		name, err := url.PathUnescape(c.Params("name"))
+		if err != nil || !validPlaylistName(name) {
+			return c.Status(400).JSON(fiber.Map{"error": "invalid playlist name"})
+		}
 		m, err := getMPD()
 		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+			return c.Status(503).JSON(fiber.Map{"error": "mpd unavailable"})
 		}
 		lines, _ := m.raw("listplaylistinfo", name)
 		return c.JSON(fiber.Map{"name": name, "tracks": parseTrackList(lines)})
 	})
 	app.Delete("/saved-playlists/:name", func(c fiber.Ctx) error {
-		name, _ := url.QueryUnescape(c.Params("name"))
+		name, err := url.PathUnescape(c.Params("name"))
+		if err != nil || !validPlaylistName(name) {
+			return c.Status(400).JSON(fiber.Map{"error": "invalid playlist name"})
+		}
 		m, err := getMPD()
 		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+			return c.Status(503).JSON(fiber.Map{"error": "mpd unavailable"})
 		}
-		m.exec("rm", name)
+		if err := m.exec("rm", name); err != nil {
+			return c.Status(502).JSON(fiber.Map{"error": "playlist delete failed"})
+		}
 		return c.JSON(fiber.Map{"status": "ok"})
 	})
 	app.Post("/saved-playlists/:name/add", func(c fiber.Ctx) error {
-		name, _ := url.QueryUnescape(c.Params("name"))
+		name, err := url.PathUnescape(c.Params("name"))
+		if err != nil || !validPlaylistName(name) {
+			return c.Status(400).JSON(fiber.Map{"error": "invalid playlist name"})
+		}
 		var b struct {
 			File string `json:"file"`
 		}
 		if err := c.Bind().JSON(&b); err != nil || b.File == "" {
 			return c.Status(400).JSON(fiber.Map{"error": "file required"})
 		}
-		m, err := getMPD()
-		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		rel, ok := relMusicPath(b.File)
+		if !ok {
+			return c.Status(400).JSON(fiber.Map{"error": "invalid file path"})
 		}
-		m.exec("playlistadd", name, b.File)
+		if err := mpdExecErr("playlistadd", name, rel); err != nil {
+			log.Printf("playlistadd %q: %v", name, err)
+			return c.Status(502).JSON(fiber.Map{"error": "playlist update failed"})
+		}
 		return c.JSON(fiber.Map{"status": "ok"})
 	})
 	// Алиас /saved-playlists/:name/tracks — добавление трека в плейлист (кнопка «➕ В плейлист»).
 	app.Post("/saved-playlists/:name/tracks", func(c fiber.Ctx) error {
-		name, _ := url.QueryUnescape(c.Params("name"))
+		name, err := url.PathUnescape(c.Params("name"))
+		if err != nil || !validPlaylistName(name) {
+			return c.Status(400).JSON(fiber.Map{"error": "invalid playlist name"})
+		}
 		var b struct {
 			File string `json:"file"`
 		}
 		if err := c.Bind().JSON(&b); err != nil || b.File == "" {
 			return c.Status(400).JSON(fiber.Map{"error": "file required"})
 		}
-		m, err := getMPD()
-		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		rel, ok := relMusicPath(b.File)
+		if !ok {
+			return c.Status(400).JSON(fiber.Map{"error": "invalid file path"})
 		}
-		if err := m.exec("playlistadd", name, b.File); err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		if err := mpdExecErr("playlistadd", name, rel); err != nil {
+			log.Printf("playlistadd %q: %v", name, err)
+			return c.Status(502).JSON(fiber.Map{"error": "playlist update failed"})
 		}
 		return c.JSON(fiber.Map{"status": "ok"})
 	})
@@ -1095,8 +1400,8 @@ func main() {
 	})
 
 	app.Get("/albums/:artist/:album", func(c fiber.Ctx) error {
-		artist, _ := url.QueryUnescape(c.Params("artist"))
-		album, _ := url.QueryUnescape(c.Params("album"))
+		artist, _ := url.PathUnescape(c.Params("artist"))
+		album, _ := url.PathUnescape(c.Params("album"))
 		tracks, err := albumTracks(artist, album)
 		if err != nil || tracks == nil {
 			tracks = []fiber.Map{}
@@ -1112,8 +1417,12 @@ func main() {
 		if err := c.Bind().JSON(&b); err != nil {
 			return c.Status(400).JSON(fiber.Map{"error": "invalid body"})
 		}
+		if strings.TrimSpace(b.Artist) == "" || strings.TrimSpace(b.Album) == "" {
+			return c.Status(400).JSON(fiber.Map{"error": "artist and album required"})
+		}
 		if err := playAlbum(b.Artist, b.Album); err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+			log.Printf("play album %q/%q: %v", b.Artist, b.Album, err)
+			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "play failed"})
 		}
 		// Инвалидация кэша треков альбома после запуска воспроизведения (best-effort).
 		if rdb != nil {
@@ -1129,53 +1438,68 @@ func main() {
 		if err := c.Bind().JSON(&b); err != nil || b.File == "" {
 			return c.Status(400).JSON(fiber.Map{"error": "file required"})
 		}
+		rel, ok := relMusicPath(b.File)
+		if !ok {
+			return c.Status(400).JSON(fiber.Map{"error": "invalid file path"})
+		}
 		m, err := getMPD()
 		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+			return c.Status(503).JSON(fiber.Map{"error": "mpd unavailable"})
 		}
-		if err := m.exec("clear"); err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		added, err := replaceQueueAndPlay(m, []string{rel})
+		if err != nil {
+			log.Printf("play-file %q: %v", rel, err)
+			return c.Status(502).JSON(fiber.Map{"error": "queue update failed", "added": added})
 		}
-		if err := m.exec("add", b.File); err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
-		}
-		if err := m.exec("play"); err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
-		}
-		return c.JSON(fiber.Map{"status": "playing", "file": b.File})
+		return c.JSON(fiber.Map{"status": "playing", "file": rel})
 	})
 
 	app.Get("/covers/:artist/:album", func(c fiber.Ctx) error {
-		artist, _ := url.QueryUnescape(c.Params("artist"))
-		album, _ := url.QueryUnescape(c.Params("album"))
-		p := coverFile(artist, album)
-		if p == "" {
-			// Локальной обложки нет: iTunes (работает в РФ) → MusicBrainz.
-			if u := itunesCoverURL(artist, album); u != "" {
-				return c.Redirect().Status(fiber.StatusFound).To(u)
-			}
-			if u := musicBrainzCoverURL(artist, album); u != "" {
-				return c.Redirect().Status(fiber.StatusFound).To(u)
-			}
-			c.Set("Content-Type", "image/png")
-			return c.Send([]byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x62, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82})
+		artist, ok := coverParam(c, "artist")
+		if !ok {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid artist"})
 		}
-		switch strings.ToLower(filepath.Ext(p)) {
-		case ".png":
-			c.Set("Content-Type", "image/png")
-		case ".webp":
-			c.Set("Content-Type", "image/webp")
-		default:
-			c.Set("Content-Type", "image/jpeg")
+		album, ok := coverParam(c, "album")
+		if !ok {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid album"})
 		}
-		c.Set("Cache-Control", "public, max-age=86400")
-		return c.SendFile(p)
+		if p := coverFile(artist, album); p != "" {
+			ct := imageContentType(p)
+			if ct == "" {
+				return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "not found"})
+			}
+			c.Set("Content-Type", ct)
+			c.Set("X-Content-Type-Options", "nosniff")
+			c.Set("Content-Disposition", `inline; filename="cover"`)
+			c.Set("Cache-Control", "public, max-age=86400")
+			return c.SendFile(p)
+		}
+		// Локальной обложки нет: iTunes (работает в РФ) → MusicBrainz.
+		// URL из внешнего API проверяется allowlist'ом (иначе open redirect).
+		if u := itunesCoverURL(artist, album); u != "" {
+			c.Set("Cache-Control", "public, max-age=600")
+			return c.Redirect().Status(fiber.StatusFound).To(u)
+		}
+		if u := musicBrainzCoverURL(artist, album); u != "" {
+			c.Set("Cache-Control", "public, max-age=600")
+			return c.Redirect().Status(fiber.StatusFound).To(u)
+		}
+		c.Set("Content-Type", "image/png")
+		c.Set("X-Content-Type-Options", "nosniff")
+		c.Set("Cache-Control", "public, max-age=60")
+		return c.Send([]byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x62, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82})
 	})
 
 	// Нормализованные метаданные альбома из MusicBrainz.
 	app.Get("/metadata/:artist/:album", func(c fiber.Ctx) error {
-		artist, _ := url.QueryUnescape(c.Params("artist"))
-		album, _ := url.QueryUnescape(c.Params("album"))
+		artist, ok := coverParam(c, "artist")
+		if !ok {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid artist"})
+		}
+		album, ok := coverParam(c, "album")
+		if !ok {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid album"})
+		}
 		if it, err := fetchITunesAlbum(artist, album); err == nil {
 			year := ""
 			if len(it.ReleaseDate) >= 4 {
@@ -1183,12 +1507,13 @@ func main() {
 			}
 			return c.JSON(fiber.Map{
 				"artist": it.ArtistName, "album": it.CollectionName, "year": year,
-				"cover": itunesCoverURL(artist, album), "source": "itunes",
+				"cover": itunesArtworkURL(it.ArtworkURL100), "source": "itunes",
 			})
 		}
 		rel, err := fetchMusicBrainzRelease(artist, album)
 		if err != nil {
-			return c.Status(404).JSON(fiber.Map{"error": err.Error()})
+			log.Printf("metadata %q/%q: %v", artist, album, err)
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "not found"})
 		}
 		year := ""
 		if len(rel.Date) >= 4 {
@@ -1201,7 +1526,7 @@ func main() {
 		return c.JSON(fiber.Map{
 			"artist": name, "album": rel.Title, "year": year,
 			"mbid": rel.ID, "source": "musicbrainz",
-			"cover": "https://coverartarchive.org/release/" + rel.ID + "/front-500",
+			"cover": coverArtArchiveURL(rel.ID),
 		})
 	})
 
@@ -1209,7 +1534,7 @@ func main() {
 	app.Get("/radio/next", func(c fiber.Ctx) error {
 		m, err := getMPD()
 		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+			return c.Status(503).JSON(fiber.Map{"error": "mpd unavailable"})
 		}
 		cur := fieldsToMap(m.fields("currentsong"))
 		artist, _ := cur["artist"].(string)
@@ -1234,56 +1559,83 @@ func main() {
 		}
 		next := candidates[idx]
 		file, _ := next["file"].(string)
-		m.exec("clear")
-		m.exec("add", file)
-		m.exec("play")
+		if _, err := replaceQueueAndPlay(m, []string{file}); err != nil {
+			return c.Status(502).JSON(fiber.Map{"error": "queue update failed"})
+		}
 		return c.JSON(fiber.Map{"status": "ok", "title": next["title"], "artist": artist})
 	})
 
 	app.Get("/search", func(c fiber.Ctx) error {
-		q := c.Query("q")
+		q := strings.TrimSpace(c.Query("q"))
 		if q == "" {
 			return c.JSON(fiber.Map{"results": []fiber.Map{}})
 		}
-		return c.JSON(fiber.Map{"results": mpdSearch(q)})
+		if len(q) > 200 {
+			return c.Status(400).JSON(fiber.Map{"error": "query too long"})
+		}
+		res := mpdSearch(q)
+		truncated := false
+		if len(res) > 500 {
+			res = res[:500]
+			truncated = true
+		}
+		return c.JSON(fiber.Map{"results": res, "truncated": truncated})
 	})
 
 	// ==================== ТЕКСТ ПЕСНИ (LRCLIB) ====================
 	app.Get("/lyrics", func(c fiber.Ctx) error {
-		artist := c.Query("artist")
-		track := c.Query("track")
-		album := c.Query("album")
-		duration := c.Query("duration", "0")
+		artist := clampTag(c.Query("artist"))
+		track := clampTag(c.Query("track"))
+		album := clampTag(c.Query("album"))
 		if artist == "" || track == "" {
 			return c.Status(400).JSON(fiber.Map{"error": "artist and track required"})
 		}
-		cacheKey := "lyrics:" + artist + ":" + track
-		if cached, err := rdb.Get(ctx, cacheKey).Result(); err == nil && cached != "" {
-			c.Set("Content-Type", "application/json")
-			return c.SendString(cached)
+		cacheKey := lyricsCacheKey(artist, track)
+		if rdb != nil {
+			if cached, err := rdb.Get(ctx, cacheKey).Result(); err == nil && cached != "" {
+				c.Set("Content-Type", "application/json")
+				c.Set("X-Content-Type-Options", "nosniff")
+				return c.SendString(cached)
+			}
 		}
 		vals := url.Values{
 			"artist_name": {artist},
 			"track_name":  {track},
 			"album_name":  {album},
 		}
-		if d, _ := strconv.Atoi(duration); d > 0 {
+		if d, err := strconv.Atoi(c.Query("duration", "0")); err == nil && d > 0 && d <= 24*3600 {
 			vals.Set("duration", strconv.Itoa(d))
 		}
-		u := "https://lrclib.net/api/get?" + vals.Encode()
-		req, _ := http.NewRequest("GET", u, nil)
-		req.Header.Set("User-Agent", "NAS-Stack/1.0 (https://github.com/FuzzyHD1993/nas-stack)")
-		resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+		qctx, cancel := context.WithTimeout(c.Context(), 12*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(qctx, http.MethodGet,
+			"https://lrclib.net/api/get?"+vals.Encode(), nil)
 		if err != nil {
-			return c.Status(502).JSON(fiber.Map{"error": err.Error()})
+			return c.Status(500).JSON(fiber.Map{"error": "internal error"})
+		}
+		req.Header.Set("User-Agent", "NAS-Stack/1.0 (https://github.com/FuzzyHD1993/nas-stack)")
+		resp, err := lyricsHTTP.Do(req)
+		if err != nil {
+			log.Printf("lyrics %q/%q: %v", artist, track, err)
+			return c.Status(502).JSON(fiber.Map{"error": "lyrics unavailable"})
 		}
 		defer resp.Body.Close()
-		body, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode == 200 {
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxLyricsBody+1))
+		if err != nil || len(body) > maxLyricsBody {
+			return c.Status(502).JSON(fiber.Map{"error": "lyrics unavailable"})
+		}
+		if resp.StatusCode != http.StatusOK {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "lyrics not found"})
+		}
+		if !json.Valid(body) {
+			return c.Status(502).JSON(fiber.Map{"error": "lyrics unavailable"})
+		}
+		if rdb != nil {
 			_ = rdb.Set(ctx, cacheKey, string(body), 24*time.Hour).Err()
 		}
 		c.Set("Content-Type", "application/json")
-		return c.Status(resp.StatusCode).Send(body)
+		c.Set("X-Content-Type-Options", "nosniff")
+		return c.Send(body)
 	})
 
 	// ==================== ИЗБРАННОЕ ====================
@@ -1292,10 +1644,11 @@ func main() {
 		items := []fiber.Map{}
 		for k, v := range vals {
 			var m map[string]interface{}
-			if json.Unmarshal([]byte(v), &m) == nil {
-				m["file_path"] = k
-				items = append(items, m)
+			if err := json.Unmarshal([]byte(v), &m); err != nil || m == nil {
+				continue
 			}
+			m["file_path"] = k
+			items = append(items, m)
 		}
 		sort.Slice(items, func(i, j int) bool { return fmt.Sprint(items[i]["added_at"]) > fmt.Sprint(items[j]["added_at"]) })
 		return c.JSON(fiber.Map{"favorites": items, "count": len(items)})
@@ -1310,13 +1663,20 @@ func main() {
 		if err := c.Bind().JSON(&b); err != nil || b.FilePath == "" {
 			return c.Status(400).JSON(fiber.Map{"error": "file_path required"})
 		}
+		rel, ok := relMusicPath(b.FilePath)
+		if !ok {
+			return c.Status(400).JSON(fiber.Map{"error": "invalid file_path"})
+		}
 		rec := fiber.Map{"title": b.Title, "artist": b.Artist, "album": b.Album, "added_at": time.Now().Format(time.RFC3339)}
 		data, _ := json.Marshal(rec)
-		_ = rdb.HSet(ctx, "music:favorites", b.FilePath, string(data)).Err()
+		_ = rdb.HSet(ctx, "music:favorites", rel, string(data)).Err()
 		return c.JSON(fiber.Map{"status": "ok"})
 	})
 	app.Get("/favorites/check", func(c fiber.Ctx) error {
 		fp := c.Query("file_path")
+		if rel, ok := relMusicPath(fp); ok {
+			fp = rel
+		}
 		fav, err := rdb.HExists(ctx, "music:favorites", fp).Result()
 		if err != nil || !fav {
 			return c.JSON(fiber.Map{"favorite": false})
@@ -1324,7 +1684,10 @@ func main() {
 		return c.JSON(fiber.Map{"favorite": true, "id": fp})
 	})
 	app.Delete("/favorites/*", func(c fiber.Ctx) error {
-		fp, _ := url.QueryUnescape(c.Params("*"))
+		fp, _ := url.PathUnescape(c.Params("*"))
+		if rel, ok := relMusicPath(fp); ok {
+			fp = rel
+		}
 		_ = rdb.HDel(ctx, "music:favorites", fp).Err()
 		return c.JSON(fiber.Map{"status": "removed"})
 	})
@@ -1380,7 +1743,7 @@ func main() {
 
 	// ==================== ПОХОЖИЕ ТРЕКИ ====================
 	app.Get("/similar", func(c fiber.Ctx) error {
-		file, _ := url.QueryUnescape(c.Query("file"))
+		file := c.Query("file")
 		artist := c.Query("artist")
 		if artist == "" && file != "" {
 			// попытаться определить артиста из текущего
@@ -1411,17 +1774,34 @@ func main() {
 		var b struct {
 			Artist string `json:"artist"`
 		}
-		if err := c.Bind().JSON(&b); err != nil || b.Artist == "" {
-			return c.Status(400).JSON(fiber.Map{"error": "artist required"})
+		if err := c.Bind().JSON(&b); err != nil || strings.TrimSpace(b.Artist) == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "artist required"})
+		}
+		name := normArtist(b.Artist)
+
+		_, byName, idxErr := getArtistIndex()
+		tracks, canonical, ok := lookupArtist(byName, name)
+		if !ok || len(tracks) == 0 {
+			if len(byName) == 0 && idxErr != nil {
+				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "artist index unavailable"})
+			}
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "artist not found"})
 		}
 		m, err := getMPD()
 		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+			log.Printf("play artist: mpd: %v", err)
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "mpd unavailable"})
 		}
-		m.exec("clear")
-		m.exec("searchadd", "Artist", b.Artist)
-		m.exec("play")
-		return c.JSON(fiber.Map{"status": "ok", "artist": b.Artist})
+		files := make([]string, 0, len(tracks))
+		for _, t := range tracks {
+			files = append(files, t.File)
+		}
+		added, err := replaceQueueAndPlay(m, files)
+		if err != nil {
+			log.Printf("play artist %q: %v", name, err)
+			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "queue update failed", "added": added})
+		}
+		return c.JSON(fiber.Map{"status": "ok", "artist": canonical, "count": added})
 	})
 
 	// ==================== ПЕРЕМЕЩЕНИЕ В ОЧЕРЕДИ ====================
@@ -1433,8 +1813,12 @@ func main() {
 		if err := c.Bind().JSON(&b); err != nil {
 			return c.Status(400).JSON(fiber.Map{"error": "invalid body"})
 		}
+		if b.From < 0 || b.To < 0 || b.From > 1_000_000 || b.To > 1_000_000 {
+			return c.Status(400).JSON(fiber.Map{"error": "invalid positions"})
+		}
 		if err := mpdExecErr("move", strconv.Itoa(b.From), strconv.Itoa(b.To)); err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+			log.Printf("queue move: %v", err)
+			return c.Status(400).JSON(fiber.Map{"error": "invalid move"})
 		}
 		return c.JSON(fiber.Map{"status": "moved"})
 	})
@@ -1449,13 +1833,24 @@ func main() {
 		if err := c.Bind().JSON(&b); err != nil || b.FilePath == "" {
 			return c.Status(400).JSON(fiber.Map{"error": "file_path required"})
 		}
+		rel, ok := relMusicPath(b.FilePath)
+		if !ok {
+			return c.Status(400).JSON(fiber.Map{"error": "invalid file_path"})
+		}
+		if b.PositionSec < 0 || b.DurationSec < 0 ||
+			b.PositionSec > 24*3600 || b.DurationSec > 24*3600 {
+			return c.Status(400).JSON(fiber.Map{"error": "invalid position"})
+		}
 		data, _ := json.Marshal(fiber.Map{"position_sec": b.PositionSec, "duration_sec": b.DurationSec, "updated_at": time.Now().Format(time.RFC3339)})
-		_ = rdb.Set(ctx, "music:progress:"+b.FilePath, string(data), 30*24*time.Hour).Err()
+		_ = rdb.Set(ctx, progressKey(rel), string(data), 30*24*time.Hour).Err()
 		return c.JSON(fiber.Map{"status": "ok"})
 	})
 	app.Get("/track/progress", func(c fiber.Ctx) error {
-		fp := c.Query("file_path")
-		s, err := rdb.Get(ctx, "music:progress:"+fp).Result()
+		rel, ok := relMusicPath(c.Query("file_path"))
+		if !ok {
+			return c.Status(400).JSON(fiber.Map{"error": "invalid file_path"})
+		}
+		s, err := rdb.Get(ctx, progressKey(rel)).Result()
 		if err != nil || s == "" {
 			return c.JSON(fiber.Map{"position_sec": 0})
 		}
@@ -1463,8 +1858,24 @@ func main() {
 		return c.SendString(s)
 	})
 
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+		<-sig
+		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = app.ShutdownWithContext(sctx)
+	}()
 	log.Println("🎵 music-service на :8092")
-	log.Fatal(app.Listen(":8092"))
+	if err := app.Listen(":8092"); err != nil {
+		log.Printf("listen: %v", err)
+	}
+	if db != nil {
+		db.Close()
+	}
+	if rdb != nil {
+		_ = rdb.Close()
+	}
 }
 
 // mpdExecErr — как mpdExec, но возвращает ошибку.
@@ -1476,13 +1887,13 @@ func mpdExecErr(cmd string, args ...string) error {
 	return m.exec(cmd, args...)
 }
 
-// mpdExec — выполнить команду на глобальном клиенте, игнорируя ошибки.
-func mpdExec(cmd string, args ...string) {
-	m, err := getMPD()
-	if err != nil {
-		return
+// mpdOK отвечает ok только при реальном успехе MPD.
+func mpdOK(c fiber.Ctx, cmd string, args ...string) error {
+	if err := mpdExecErr(cmd, args...); err != nil {
+		log.Printf("mpd %s: %v", cmd, err)
+		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "mpd command failed"})
 	}
-	m.exec(cmd, args...)
+	return c.JSON(fiber.Map{"status": "ok"})
 }
 
 // audioExts — расширения аудиофайлов для догрузки папки.
@@ -1512,9 +1923,15 @@ func ensureNextTrack(m *mpdClient) {
 	if file == "" {
 		return
 	}
-	dir := filepath.Dir(file)
-	musicDir := platform.GetEnv("MUSIC_DIR", "/mnt/nas/root/FuzzyHD/Music")
-	entries, err := os.ReadDir(filepath.Join(musicDir, dir))
+	rel, ok := relMusicPath(file)
+	if !ok {
+		return
+	}
+	dir := path.Dir(rel)
+	if dir == "." {
+		return
+	}
+	tracks, err := albumAudioFiles(dir)
 	if err != nil {
 		return
 	}
@@ -1529,15 +1946,11 @@ func ensureNextTrack(m *mpdClient) {
 	}
 
 	added := 0
-	for _, e := range entries {
-		if e.IsDir() || !audioExts[strings.ToLower(filepath.Ext(e.Name()))] {
+	for _, track := range tracks {
+		if existing[track] {
 			continue
 		}
-		rel := filepath.ToSlash(filepath.Join(dir, e.Name()))
-		if existing[rel] {
-			continue
-		}
-		if err := m.exec("add", rel); err == nil {
+		if err := m.exec("add", track); err == nil {
 			added++
 		}
 	}

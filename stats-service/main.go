@@ -683,12 +683,25 @@ func hostAgentURL() string {
 }
 
 func hostAgentGet(path string) ([]byte, error) {
+	req, err := http.NewRequest(http.MethodGet, hostAgentURL()+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	if t := strings.TrimSpace(platform.GetEnv("ADMIN_TOKEN", "")); t != "" {
+		req.Header.Set("X-Admin-Token", t)
+	}
+
 	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Get(hostAgentURL() + path)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("host-agent %s: %s: %s", path, resp.Status, strings.TrimSpace(string(b)))
+	}
 	return io.ReadAll(resp.Body)
 }
 

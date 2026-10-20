@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"strconv"
 	"strings"
 	"time"
@@ -8,6 +9,10 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/prometheus/client_golang/prometheus"
 )
+
+// unmatchedRoute — единая метка для запросов вне роутов: сырой URL в label
+// даёт неограниченное число серий Prometheus.
+const unmatchedRoute = "__unmatched__"
 
 var (
 	httpDuration = prometheus.NewHistogramVec(
@@ -38,20 +43,48 @@ func init() {
 }
 
 // metricsMiddleware собирает метрики запросов для Prometheus.
-// c.Method()/c.Path() в Fiber v3 возвращают zero-copy строки над мутируемым
-// буфером, поэтому для label-ов обязательно клонируем (иначе порча метрик).
+// c.Method() в Fiber v3 возвращает zero-copy строку над мутируемым буфером,
+// поэтому method клонируем. Путь берём из шаблона роута, для несматченных
+// запросов — sentinel (иначе любой сканер создаёт неограниченное число серий).
+// Статус вычисляем после c.Next() с учётом err: ErrorHandler вызывается уже
+// после возврата из middleware, поэтому Response().StatusCode() для ошибок
+// ещё не финальный.
 func metricsMiddleware() fiber.Handler {
-	return func(c fiber.Ctx) error {
+	return func(c fiber.Ctx) (err error) {
+		// Скрейп не наблюдаем: иначе /metrics измеряет сам себя.
+		if c.Path() == "/metrics" {
+			return c.Next()
+		}
+
 		method := strings.Clone(c.Method())
-		path := strings.Clone(c.Path())
 		start := time.Now()
 		activeRequests.Inc()
-		defer activeRequests.Dec()
-		err := c.Next()
-		duration := time.Since(start).Seconds()
-		status := strconv.Itoa(c.Response().StatusCode())
-		httpDuration.WithLabelValues(method, path, status).Observe(duration)
-		httpTotal.WithLabelValues(method, path, status).Inc()
-		return err
+
+		defer func() {
+			activeRequests.Dec()
+
+			path := unmatchedRoute
+			if c.Matched() {
+				if r := c.Route(); r != nil && r.Path != "" {
+					path = strings.Clone(r.Path)
+				}
+			}
+
+			status := c.Response().StatusCode()
+			if err != nil {
+				var fe *fiber.Error
+				if errors.As(err, &fe) {
+					status = fe.Code
+				} else {
+					status = fiber.StatusInternalServerError
+				}
+			}
+
+			labelStatus := strconv.Itoa(status)
+			httpDuration.WithLabelValues(method, path, labelStatus).Observe(time.Since(start).Seconds())
+			httpTotal.WithLabelValues(method, path, labelStatus).Inc()
+		}()
+
+		return c.Next()
 	}
 }

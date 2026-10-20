@@ -58,6 +58,9 @@ func TestValidateProxyPath(t *testing.T) {
 		`..\..\etc\passwd`,
 		"ok/../../etc",
 		"..%252f..%252fetc/passwd",
+		"..%2525252f..%2525252fetc/passwd",
+		"update%3Frun",
+		"update%23run",
 		"health%00",
 	} {
 		if err := validateProxyPath(p); err == nil {
@@ -103,28 +106,59 @@ func TestProxyHandlerRejectsTraversal(t *testing.T) {
 func TestRequireAuthRejectsNonHS256(t *testing.T) {
 	withSecrets(t, "", "")
 
-	const secret = "test-secret"
+	const secret = "test-secret-0123456789abcdef01234567"
 	app := fiber.New()
 	app.Get("/status", requireAuthMiddleware([]byte(secret), true), func(c fiber.Ctx) error {
 		return c.SendString("ok")
 	})
 
-	noneTok, err := jwt.NewWithClaims(jwt.SigningMethodNone, jwt.MapClaims{
-		"sub": "user",
-		"exp": time.Now().Add(time.Hour).Unix(),
-	}).SignedString(jwt.UnsafeAllowNoneSignatureType)
+	base := func() jwt.MapClaims {
+		return jwt.MapClaims{
+			"sub":   "user",
+			"iss":   "nas-auth",
+			"scope": "admin",
+			"exp":   time.Now().Add(time.Hour).Unix(),
+		}
+	}
+
+	noneTok, err := jwt.NewWithClaims(jwt.SigningMethodNone, base()).
+		SignedString(jwt.UnsafeAllowNoneSignatureType)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	hs256, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"sub": "user",
-		"exp": time.Now().Add(time.Hour).Unix(),
-	}).SignedString([]byte(secret))
+	hs256, err := jwt.NewWithClaims(jwt.SigningMethodHS256, base()).SignedString([]byte(secret))
 	if err != nil {
 		t.Fatal(err)
 	}
-	hs512, err := jwt.NewWithClaims(jwt.SigningMethodHS512, jwt.MapClaims{
+
+	hs512, err := jwt.NewWithClaims(jwt.SigningMethodHS512, base()).SignedString([]byte(secret))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	noScopeClaims := base()
+	delete(noScopeClaims, "scope")
+	noScope, err := jwt.NewWithClaims(jwt.SigningMethodHS256, noScopeClaims).SignedString([]byte(secret))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	profileScope := base()
+	profileScope["scope"] = "profile"
+	profileTok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, profileScope).SignedString([]byte(secret))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	noExp := base()
+	delete(noExp, "exp")
+	noExpTok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, noExp).SignedString([]byte(secret))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oldTok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"sub": "user",
 		"exp": time.Now().Add(time.Hour).Unix(),
 	}).SignedString([]byte(secret))
@@ -140,6 +174,10 @@ func TestRequireAuthRejectsNonHS256(t *testing.T) {
 		{"no token", "", http.StatusUnauthorized},
 		{"alg none", noneTok, http.StatusUnauthorized},
 		{"HS512", hs512, http.StatusUnauthorized},
+		{"no scope", noScope, http.StatusUnauthorized},
+		{"profile scope", profileTok, http.StatusUnauthorized},
+		{"no exp", noExpTok, http.StatusUnauthorized},
+		{"old token without iss/scope", oldTok, http.StatusUnauthorized},
 		{"valid HS256", hs256, http.StatusOK},
 	}
 	for _, tc := range cases {
@@ -159,6 +197,10 @@ func TestSanitizeImageContentType(t *testing.T) {
 	cases := map[string]string{
 		"image/jpeg":               "image/jpeg",
 		"image/png; charset=utf-8": "image/png",
+		"IMAGE/PNG":                "image/png",
+		"image/svg+xml":            "image/jpeg",
+		"application/xhtml+xml":    "image/jpeg",
+		"image/png\r\nX-Evil: 1":   "image/jpeg",
 		"text/html":                "image/jpeg",
 		"":                         "image/jpeg",
 		"application/octet-stream": "image/jpeg",
@@ -170,13 +212,30 @@ func TestSanitizeImageContentType(t *testing.T) {
 	}
 }
 
+func TestSanitizeProxyContentType(t *testing.T) {
+	cases := map[string]string{
+		"text/html; charset=utf-8":        "text/plain; charset=utf-8",
+		"application/xhtml+xml":           "text/plain; charset=utf-8",
+		"image/svg+xml":                   "text/plain; charset=utf-8",
+		"text/xml":                        "text/plain; charset=utf-8",
+		"application/xml":                 "text/plain; charset=utf-8",
+		"application/json":                "application/json",
+		"application/json; charset=utf-8": "application/json; charset=utf-8",
+	}
+	for in, want := range cases {
+		if got := sanitizeProxyContentType(in); got != want {
+			t.Errorf("sanitizeProxyContentType(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestParseSmartQueryRuntimeBounds(t *testing.T) {
 	cases := []struct {
 		in   string
 		want map[string]interface{}
 	}{
 		{"999999999999999999999 минут", map[string]interface{}{"limit": 50}},
-		{"999999 минут", map[string]interface{}{"runtime_max": smartMaxRuntime + 10, "limit": 50}},
+		{"999999 минут", map[string]interface{}{"runtime_max": smartMaxRuntime, "limit": 50}},
 		{"0 минут", map[string]interface{}{"limit": 50}},
 		{"короткий длинный фильм", map[string]interface{}{"limit": 50}},
 		{"длинный фильм 90 минут", map[string]interface{}{"runtime_max": 100, "limit": 50}},

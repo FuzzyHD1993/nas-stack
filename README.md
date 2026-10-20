@@ -212,7 +212,7 @@ flowchart TB
 | **notify-service** | 8083 | Уведомления (`notify-send` + ntfy). Запускается на **хосте**, вне compose |
 | **scheduler-service** | 8084 | Планировщик: бэкапы, сериалы, wishlist, flac-check, healthcheck, disk/memory-check |
 | **history-service** | 8085 | История событий и статистика (PostgreSQL + Redis Pub/Sub) |
-| **auth-service** | 8086 | Логин по паролю, выдача JWT |
+| **auth-service** | 8086 (internal) | Логин по паролю, выдача JWT. Наружу не публикуется — только через gateway (`/auth/*`) |
 | **books-service** | 8087 | Поиск/скачивание книг (Флибуста), отдача EPUB, OPDS |
 | **search-service** | 8088 | Поиск торрентов через Prowlarr + Redis-кэш |
 | **youtube-service** | 8089 | Скачивание видео (yt-dlp) |
@@ -514,11 +514,13 @@ podman compose --profile flibusta-local up -d --build
 - **`/health`** каждого сервиса возвращает runtime-метрики:
   `status`, `service`, `version`, `uptime_sec`, `mem_mb`, `mem_sys_mb`, `goroutines`, `gc_count`.
   ```bash
-  for p in 8080 8081 8082 8084 8085 8086 8087 8088 8089 8090 8091 8092 8093; do
+  for p in 8080 8081 8082 8084 8085 8087 8088 8089 8090 8091 8092 8093; do
     curl -sS "http://localhost:$p/health" | jq -c '{service,mem_mb,goroutines}'
   done
   ```
-- **pprof** на `:6060` внутри контейнера (наружу не мапится):
+- **pprof** выключен по умолчанию. Включается `PPROF_ENABLED=true` и слушает
+  только loopback (`PPROF_ADDR`, по умолчанию `127.0.0.1:6060`) — heap-дампы
+  содержат секреты:
   ```bash
   podman exec nas-gateway wget -qO- 'http://127.0.0.1:6060/debug/pprof/goroutine?debug=1' | head
   podman exec nas-gateway wget -qO- 'http://127.0.0.1:6060/debug/pprof/profile?seconds=10' > cpu.prof
@@ -619,7 +621,9 @@ cd media-service && go test ./... -count=1
 без `TEST_DATABASE_URL` тест БД пропускается.
 
 ```bash
-export TEST_DATABASE_URL="postgres://nas:nas_secret@localhost:5432/nas_history?sslmode=disable"
+export TEST_DATABASE_URL="postgres://nas:nas_secret@localhost:5432/nas_history_test?sslmode=disable"
+# ВАЖНО: не указывайте здесь боевую nas_history. Тесты media-service
+# создают и удаляют временные схемы (CREATE/DROP SCHEMA) в указанной БД.
 for d in media-service music-service books-service gateway; do
     (cd "$d" && go test -tags integration ./... -count=1 -timeout 120s)
 done

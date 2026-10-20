@@ -91,6 +91,32 @@ func TestProxyHandlerStripsSensitiveHeaders(t *testing.T) {
 	}
 }
 
+// Cookie и method/URL-override не должны доезжать до upstream: gateway
+// авторизует только по Authorization/JWT.
+func TestProxyHandlerStripsCookieAndOverrideHeaders(t *testing.T) {
+	rec, upstream := newRecordingUpstream(t)
+	app := newNotifyApp(t, upstream.URL, "stats")
+
+	resp := doProxy(t, app, http.MethodGet, "/stats/health", nil, map[string]string{
+		"Cookie":                 "session=secret",
+		"X-HTTP-Method-Override": "POST",
+		"X-Method-Override":      "POST",
+		"X-Original-URL":         "/notify/env",
+		"X-Rewrite-URL":          "/notify/env",
+	})
+	assertStatus(t, resp, http.StatusOK)
+
+	_, req := rec.last(t)
+	for _, h := range []string{
+		"Cookie", "X-Http-Method-Override", "X-Method-Override",
+		"X-Original-Url", "X-Rewrite-Url",
+	} {
+		if v := req.Header.Get(h); v != "" {
+			t.Errorf("%s утёк на upstream: %q", h, v)
+		}
+	}
+}
+
 // Query пробрасывается без пере-кодирования (%2F, +, повторяющиеся ключи).
 func TestProxyHandlerPreservesRawQuery(t *testing.T) {
 	rec, upstream := newRecordingUpstream(t)
@@ -120,13 +146,18 @@ func TestProxyHandlerForwardsMethodsAndBody(t *testing.T) {
 		{"DELETE", http.MethodDelete, []byte(`{"n":4}`)},
 	}
 
+	withSecrets(t, "admin-secret", "notify-secret")
+
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			rec, upstream := newRecordingUpstream(t)
 			app := newNotifyApp(t, upstream.URL, "stats")
 
 			resp := doProxy(t, app, tc.method, "/stats/echo", tc.body,
-				map[string]string{"Content-Type": "application/json"})
+				map[string]string{
+					"Content-Type":  "application/json",
+					"Authorization": "Bearer admin-secret",
+				})
 			assertStatus(t, resp, http.StatusOK)
 
 			calls, req := rec.last(t)
@@ -172,8 +203,10 @@ func TestProxyHandlerRejectsEncodedTraversal(t *testing.T) {
 			app := newNotifyApp(t, upstream.URL, "stats")
 
 			resp := doProxy(t, app, http.MethodGet, target, nil, nil)
-			if resp.StatusCode != http.StatusBadRequest && resp.StatusCode != http.StatusNotFound {
-				t.Fatalf("%s: status = %d, want 400/404", target, resp.StatusCode)
+			// 401 возможен, если admin-guard сработал раньше (fail-closed).
+			if resp.StatusCode != http.StatusBadRequest && resp.StatusCode != http.StatusNotFound &&
+				resp.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("%s: status = %d, want 400/401/404", target, resp.StatusCode)
 			}
 			if calls, _ := rec.snapshot(); calls != 0 {
 				t.Fatalf("%s: upstream calls = %d, want 0", target, calls)
@@ -276,8 +309,8 @@ func TestProxyIntegrationAdminProtectedPath(t *testing.T) {
 		if v := req.Header.Get("X-Gateway-Token"); v != "notify-secret" {
 			t.Errorf("X-Gateway-Token = %q, want notify-secret", v)
 		}
-		if v := req.Header.Get("X-Admin-Token"); v != "admin-secret" {
-			t.Errorf("X-Admin-Token = %q, want admin-secret", v)
+		if v := req.Header.Get("X-Admin-Token"); v != "" {
+			t.Errorf("ADMIN_TOKEN не должен уходить в notify: %q", v)
 		}
 	})
 }

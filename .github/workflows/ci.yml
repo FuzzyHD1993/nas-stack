@@ -15,10 +15,10 @@ jobs:
         env:
           POSTGRES_USER: nas
           POSTGRES_PASSWORD: nas_secret
-          POSTGRES_DB: nas_history
+          POSTGRES_DB: nas_history_test
         ports: ['5432:5432']
         options: >-
-          --health-cmd "pg_isready -U nas -d nas_history"
+          --health-cmd "pg_isready -U nas -d nas_history_test"
           --health-interval 5s --health-timeout 3s --health-retries 10
       redis:
         image: redis:7-alpine
@@ -40,12 +40,27 @@ jobs:
 
       - name: vet + build + test (все модули)
         env:
-          TEST_DATABASE_URL: postgres://nas:nas_secret@localhost:5432/nas_history?sslmode=disable
+          TEST_DATABASE_URL: postgres://nas:nas_secret@localhost:5432/nas_history_test?sslmode=disable
           REDIS_ADDR: localhost:6379
         run: make lint build test
 
       - name: gateway race
         run: (cd gateway && go test -race ./... -count=1 -timeout 180s)
+
+      - name: books-service race
+        run: (cd books-service && go test -race ./... -count=1 -timeout 180s)
+
+      - name: media-service race
+        run: (cd media-service && go test -race ./... -count=1 -timeout 180s)
+
+      - name: notify-service race
+        run: (cd notify-service && go test -race ./... -count=1 -timeout 180s)
+
+      - name: scheduler-service race
+        run: (cd scheduler-service && go test -race ./... -count=1 -timeout 180s)
+
+      - name: vet integration tags (media-service)
+        run: (cd media-service && go vet -tags integration ./...)
 
   integration:
     runs-on: ubuntu-latest
@@ -56,10 +71,10 @@ jobs:
         env:
           POSTGRES_USER: nas
           POSTGRES_PASSWORD: nas_secret
-          POSTGRES_DB: nas_history
+          POSTGRES_DB: nas_history_test
         ports: ['5432:5432']
         options: >-
-          --health-cmd "pg_isready -U nas -d nas_history"
+          --health-cmd "pg_isready -U nas -d nas_history_test"
           --health-interval 5s --health-timeout 3s --health-retries 10
       redis:
         image: redis:7-alpine
@@ -76,13 +91,15 @@ jobs:
 
       - name: Run integration tests
         env:
-          TEST_DATABASE_URL: postgres://nas:nas_secret@localhost:5432/nas_history?sslmode=disable
+          TEST_DATABASE_URL: postgres://nas:nas_secret@localhost:5432/nas_history_test?sslmode=disable
           REDIS_ADDR: localhost:6379
         run: |
           set -e
-          for d in media-service music-service books-service; do
+          for d in media-service books-service; do
             echo "=== integration: $d ==="
             (cd "$d" && go test -tags integration ./... -count=1 -timeout 120s)
           done
+          echo "=== integration+race: music-service ==="
+          (cd music-service && go test -tags integration -race ./... -count=1 -timeout 180s)
           echo "=== integration+race: gateway ==="
           (cd gateway && go test -tags integration -race ./... -count=1 -timeout 180s)

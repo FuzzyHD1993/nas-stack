@@ -65,7 +65,7 @@ async function loadTorrents() {
     } catch (e) {
         console.error('loadTorrents failed:', e);
         const el = document.getElementById('torrents');
-        if (el) el.innerHTML = '<div class="error">Ошибка загрузки: ' + e.message + '</div>';
+        if (el) el.innerHTML = '<div class="error">Ошибка загрузки: ' + escapeHtml(e.message) + '</div>';
     }
 }
 
@@ -97,6 +97,20 @@ function renderTorrentsPage() {
         html += '</div>';
     }
     container.innerHTML = html;
+
+    // Делегирование вместо inline onclick: id/title из API не попадают в JS.
+    container.onclick = (e) => {
+        const card = e.target.closest('.torrent[data-torrent-id]');
+        if (!card) return;
+        const id = Number(card.dataset.torrentId) || 0;
+        const btn = e.target.closest('[data-action]');
+        if (btn) {
+            e.stopPropagation();
+            torrentAction(id, btn.dataset.action);
+            return;
+        }
+        openTorrentDetail(id);
+    };
 
     if (completedTasks.length > 0) {
         const expanded = localStorage.getItem('torrentsCompletedExpanded') === 'true';
@@ -142,7 +156,7 @@ async function openTorrentDetail(id) {
         const files = (await fr.json()).files || [];
         renderTorrentDetail(info, trackers, files);
     } catch (e) {
-        document.getElementById('td-meta').innerHTML = '<span style="color:var(--error)">Ошибка: ' + e.message + '</span>';
+        document.getElementById('td-meta').innerHTML = '<span style="color:var(--error)">Ошибка: ' + escapeHtml(e.message) + '</span>';
     }
 }
 
@@ -198,17 +212,19 @@ function closeTorrentDetail() {
 }
 
 function renderTaskCard(t) {
-    const progress = t.progress || 0;
-    const size = t.size || 0;
-    const downloaded = t.size_downloaded || 0;
-    const speedDown = t.speed_download || 0;
-    const statusNum = t.status_num || 1;
+    const progress = Number(t.progress) || 0;
+    const size = Number(t.size) || 0;
+    const downloaded = Number(t.size_downloaded) || 0;
+    const speedDown = Number(t.speed_download) || 0;
+    const statusNum = Number(t.status_num) || 1;
     const statusCls = getStatusClass(statusNum);
     const statusTxt = getStatusText(statusNum);
+    const torrentId = Number(t.id) || 0;
+    const title = escapeHtml(t.title || 'Без названия');
 
-    let html = '<div class="torrent torrent-clickable" onclick="openTorrentDetail(\'' + t.id + '\')">';
+    let html = '<div class="torrent torrent-clickable" data-torrent-id="' + torrentId + '">';
     html += '<div class="torrent-header">';
-    html += '<div class="torrent-title" title="' + (t.title || '') + '">' + (t.title || 'Без названия') + '</div>';
+    html += '<div class="torrent-title" title="' + title + '">' + title + '</div>';
     html += '<div class="torrent-status status-' + statusCls + '">' + statusTxt + '</div>';
     html += '</div>';
     html += '<div class="progress-wrap">';
@@ -220,11 +236,11 @@ function renderTaskCard(t) {
     html += '<span>⬇️ ' + formatSpeed(speedDown) + '</span>';
     html += '<div class="torrent-actions">';
     if (statusNum === 2) {
-        html += '<button onclick="event.stopPropagation(); torrentAction(\'' + t.id + '\', \'pause\')">⏸</button>';
+        html += '<button data-action="pause">⏸</button>';
     } else if (statusNum === 3) {
-        html += '<button onclick="event.stopPropagation(); torrentAction(\'' + t.id + '\', \'resume\')">▶️</button>';
+        html += '<button data-action="resume">▶️</button>';
     }
-    html += '<button class="delete" onclick="event.stopPropagation(); torrentAction(\'' + t.id + '\', \'delete\')">🗑️</button>';
+    html += '<button class="delete" data-action="delete">🗑️</button>';
     html += '</div>';
     html += '</div>';
     html += '</div>';
@@ -311,7 +327,7 @@ async function searchTorrentsUI() {
         const d = await r.json();
 
         if (d.error) {
-            res.innerHTML = '<div class="error">Ошибка: ' + d.error + '</div>';
+            res.innerHTML = '<div class="error">Ошибка: ' + escapeHtml(d.error) + '</div>';
             allTorrentResults = [];
             currentPage = 0;
             return;
@@ -329,7 +345,7 @@ async function searchTorrentsUI() {
             localStorage.setItem('searchResultsCollapsed', 'false');
         }
     } catch (e) {
-        res.innerHTML = '<div class="error">Ошибка: ' + e.message + '</div>';
+        res.innerHTML = '<div class="error">Ошибка: ' + escapeHtml(e.message) + '</div>';
     }
 }
 
@@ -362,21 +378,30 @@ function renderSearchResultsPage() {
 
     let html = '<div class="search-list">';
     pageItems.forEach(x => {
-        const title = x.title || 'Без названия';
-        const magnet = x.magnet || '';
-        const downloadUrl = x.downloadUrl || '';
+        const title = escapeHtml(x.title || 'Без названия');
+        const magnet = escapeHtml(x.magnet || '');
+        const downloadUrl = escapeHtml(x.downloadUrl || '');
+        const indexer = escapeHtml(x.indexer || '');
         html += '<div class="search-item">';
         html += '<div class="search-info">';
         html += '<div class="torrent-title" title="' + title + '">' + title + '</div>';
         html += '<div class="search-meta">📦 ' + formatSize(x.size) +
-            ' · ⬆️ ' + (x.seeders || 0) +
-            ' · ⬇️ ' + (x.leechers || 0) +
-            ' · ' + (x.indexer || '') + '</div>';
+            ' · ⬆️ ' + (Number(x.seeders) || 0) +
+            ' · ⬇️ ' + (Number(x.leechers) || 0) +
+            ' · ' + indexer + '</div>';
         html += '</div>';
-        html += '<button onclick="downloadResult(\'' + magnet.replace(/'/g, "\\'") + '\', \'' + downloadUrl.replace(/'/g, "\\'") + '\', \'' + title.replace(/'/g, "\\'") + '\')">⬇️ Скачать</button>';
+        html += '<button class="dl-btn" data-magnet="' + magnet +
+            '" data-url="' + downloadUrl +
+            '" data-title="' + title + '">⬇️ Скачать</button>';
         html += '</div>';
     });
     html += '</div>';
+    // Слушатель ставим до innerHTML; renderPagination ниже делает innerHTML +=,
+    // что не затрагивает обработчик на самом контейнере.
+    res.onclick = (e) => {
+        const btn = e.target.closest('.dl-btn');
+        if (btn) downloadResult(btn.dataset.magnet, btn.dataset.url, btn.dataset.title);
+    };
     res.innerHTML = html;
 
     renderPagination(currentPage, totalPages, total);
@@ -513,9 +538,11 @@ function renderYoutubeJobs() {
                          j.status === 'cancelled' ? '⏸ Отменено' :
                          '⬇️ ' + progress + '%';
 
+        const jid = Number(j.id) || 0;
+
         html += '<div class="torrent">';
         html += '<div class="torrent-header">';
-        html += '<div class="torrent-title">' + (j.title || j.url) + '</div>';
+        html += '<div class="torrent-title">' + escapeHtml(j.title || j.url || '') + '</div>';
         html += '<div class="torrent-status status-' + statusCls + '">' + statusTxt + '</div>';
         html += '</div>';
         html += '<div class="progress-wrap">';
@@ -523,14 +550,14 @@ function renderYoutubeJobs() {
         html += '<div class="progress-text">' + progress + '%</div>';
         html += '</div>';
         html += '<div class="torrent-meta">';
-        html += '<span>' + (j.error || '') + '</span>';
+        html += '<span>' + escapeHtml(j.error || '') + '</span>';
         html += '<div class="torrent-actions">';
         if (j.status === 'done') {
-            html += '<button onclick="openYoutubeJob(\'' + j.id + '\')">▶️ VLC</button>';
-            html += '<button onclick="copyYoutubePath(\'' + j.id + '\')">📋 Путь</button>';
+            html += '<button onclick="openYoutubeJob(' + jid + ')">▶️ VLC</button>';
+            html += '<button onclick="copyYoutubePath(' + jid + ')">📋 Путь</button>';
         }
         if (j.status === 'downloading' || j.status === 'starting') {
-            html += '<button class="delete" onclick="cancelYoutubeJob(\'' + j.id + '\')">❌</button>';
+            html += '<button class="delete" onclick="cancelYoutubeJob(' + jid + ')">❌</button>';
         }
         html += '</div></div></div>';
     });
@@ -572,7 +599,10 @@ async function openYoutubeJob(id) {
     const name = j && j.path ? j.path.split('/').pop() : '';
     if (!name) { alert('Ошибка: путь не найден'); return; }
     try {
-        const r = await fetch(NAS_CONFIG.booksOpenerUrl + '/open-video?name=' + encodeURIComponent(name));
+        const r = await fetch(NAS_CONFIG.booksOpenerUrl + '/open-video?name=' + encodeURIComponent(name), {
+            method: 'POST',
+            headers: {'X-Opener': '1'}
+        });
         const d = await r.json();
         if (d.error) alert('Ошибка: ' + d.error);
     } catch (e) {

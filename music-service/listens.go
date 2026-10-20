@@ -1,23 +1,37 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"log"
+	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/FuzzyHD1993/nas-stack/internal/platform"
 	"github.com/gofiber/fiber/v3"
+	"github.com/jackc/pgx/v5"
 )
+
+// dbTimeout ограничивает запросы к PostgreSQL: зависший запрос не должен
+// удерживать HTTP-хендлер (и соединение из пула) бесконечно.
+const dbTimeout = 10 * time.Second
+
+func dbCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, dbTimeout)
+}
 
 // migrateListens создаёт таблицу истории прослушиваний.
 func migrateListens() error {
-	_, err := db.Exec(ctx, `
+	mctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	_, err := db.Exec(mctx, `
 		CREATE TABLE IF NOT EXISTS listens (
 			id SERIAL PRIMARY KEY,
 			track_path TEXT NOT NULL,
@@ -30,23 +44,29 @@ func migrateListens() error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_listens_track ON listens(track_path);
 		CREATE INDEX IF NOT EXISTS idx_listens_played ON listens(played_at DESC);
+		CREATE INDEX IF NOT EXISTS idx_listens_track_played ON listens(track_path, played_at DESC);
 		CREATE INDEX IF NOT EXISTS idx_listens_artist ON listens(artist);
 	`)
 	return err
 }
 
+// parseFloat парсит числовой тег MPD. NaN/±Inf, отрицательные и абсурдные
+// значения → 0: они попадают в int() и в INT-колонку duration_sec.
 func parseFloat(s string) float64 {
-	f, _ := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	f, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f < 0 || f > 24*3600 {
+		return 0
+	}
 	return f
 }
 
-// ---------- индексация музыкальной библиотеки (с кэшем) ----------
-
-var audioExtsSmart = map[string]bool{
-	".flac": true, ".mp3": true, ".ogg": true, ".oga": true, ".opus": true,
-	".wav": true, ".m4a": true, ".aac": true, ".dsf": true, ".dff": true,
-	".ape": true, ".wv": true,
+// dbFail логирует детали и не отдаёт клиенту текст ошибки PostgreSQL.
+func dbFail(c fiber.Ctx, op string, err error) error {
+	log.Printf("listens: %s: %v", op, err)
+	return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "internal error"})
 }
+
+// ---------- индексация музыкальной библиотеки (с кэшем) ----------
 
 type musicFile struct {
 	Path    string
@@ -54,34 +74,70 @@ type musicFile struct {
 }
 
 var (
-	musicIdxMu   sync.Mutex
+	musicIdxMu   sync.RWMutex
+	musicScanMu  sync.Mutex // сериализует только перестройку индекса
 	musicIdx     []musicFile
 	musicIdxTime time.Time
 )
 
+// musicIndex возвращает копию снимка. Мьютекс чтения удерживается только на
+// копирование: обход NAS не блокирует читателей. Ошибка обхода не затирает
+// прошлый удачный снимок.
 func musicIndex() []musicFile {
-	musicIdxMu.Lock()
-	defer musicIdxMu.Unlock()
-	if time.Since(musicIdxTime) < 10*time.Minute && musicIdx != nil {
-		return musicIdx
+	musicIdxMu.RLock()
+	idx, ts := musicIdx, musicIdxTime
+	musicIdxMu.RUnlock()
+	if idx != nil && time.Since(ts) < 10*time.Minute {
+		return slices.Clone(idx)
 	}
-	base := platform.GetEnv("MUSIC_DIR", "/mnt/nas/root/FuzzyHD/Music")
-	files := []musicFile{}
-	_ = filepath.WalkDir(base, func(p string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+
+	musicScanMu.Lock()
+	defer musicScanMu.Unlock()
+
+	// Пока ждали musicScanMu, другой горутин мог уже обновить снимок.
+	musicIdxMu.RLock()
+	idx, ts = musicIdx, musicIdxTime
+	musicIdxMu.RUnlock()
+	if idx != nil && time.Since(ts) < 10*time.Minute {
+		return slices.Clone(idx)
+	}
+
+	base, ok := musicRoot()
+	if !ok {
+		return slices.Clone(idx)
+	}
+	files := make([]musicFile, 0, 4096)
+	walkErr := filepath.WalkDir(base, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			log.Printf("musicIndex: %v", err)
+			return nil // недоступный подкаталог не отменяет весь скан
+		}
+		if d.IsDir() {
 			return nil
 		}
-		if audioExtsSmart[strings.ToLower(filepath.Ext(p))] {
-			if info, e := d.Info(); e == nil {
-				rel, _ := filepath.Rel(base, p)
-				files = append(files, musicFile{Path: filepath.ToSlash(rel), ModTime: info.ModTime()})
-			}
+		if !audioExts[strings.ToLower(filepath.Ext(p))] {
+			return nil
 		}
+		info, err := d.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			return nil
+		}
+		rel, err := filepath.Rel(base, p)
+		if err != nil || strings.HasPrefix(rel, "..") {
+			return nil
+		}
+		files = append(files, musicFile{Path: filepath.ToSlash(rel), ModTime: info.ModTime()})
 		return nil
 	})
-	musicIdx = files
-	musicIdxTime = time.Now()
-	return files
+	if walkErr != nil {
+		log.Printf("musicIndex: walk %q: %v", base, walkErr)
+		return slices.Clone(idx)
+	}
+
+	musicIdxMu.Lock()
+	musicIdx, musicIdxTime = files, time.Now()
+	musicIdxMu.Unlock()
+	return slices.Clone(files)
 }
 
 func trackMap(path, artist, album, title string) fiber.Map {
@@ -93,7 +149,43 @@ func trackMap(path, artist, album, title string) fiber.Map {
 
 // ---------- умные плейлисты ----------
 
+// smartRecent — «недавно слушал»: последние уникальные треки из истории.
+// Если истории ещё нет (или БД недоступна), откатываемся на mtime файлов.
 func smartRecent(limit int) ([]fiber.Map, error) {
+	if db != nil {
+		qctx, cancel := dbCtx()
+		defer cancel()
+		rows, err := db.Query(qctx, `
+			SELECT track_path, artist, album, title FROM (
+				SELECT DISTINCT ON (track_path)
+				       track_path, COALESCE(artist,'') AS artist,
+				       COALESCE(album,'') AS album, COALESCE(title,'') AS title, played_at
+				FROM listens
+				WHERE played_at > NOW() - INTERVAL '90 days'
+				ORDER BY track_path, played_at DESC
+			) t
+			ORDER BY played_at DESC
+			LIMIT $1`, limit)
+		if err == nil {
+			out := []fiber.Map{}
+			for rows.Next() {
+				var p, a, al, t string
+				if err := rows.Scan(&p, &a, &al, &t); err != nil {
+					rows.Close()
+					return nil, err
+				}
+				out = append(out, trackMap(p, a, al, t))
+			}
+			err = rows.Err()
+			rows.Close()
+			if err != nil {
+				return nil, err
+			}
+			if len(out) > 0 {
+				return out, nil
+			}
+		}
+	}
 	files := musicIndex()
 	sort.Slice(files, func(i, j int) bool { return files[i].ModTime.After(files[j].ModTime) })
 	out := []fiber.Map{}
@@ -110,7 +202,9 @@ func smartTopPeriod(days, limit int) ([]fiber.Map, error) {
 	if db == nil {
 		return []fiber.Map{}, nil
 	}
-	rows, err := db.Query(ctx, `
+	qctx, cancel := dbCtx()
+	defer cancel()
+	rows, err := db.Query(qctx, `
 		SELECT track_path, COALESCE(artist,''), COALESCE(album,''), COALESCE(title,''), COUNT(*) AS cnt
 		FROM listens
 		WHERE played_at > NOW() - make_interval(days => $1)
@@ -131,21 +225,36 @@ func smartTopPeriod(days, limit int) ([]fiber.Map, error) {
 			out = append(out, m)
 		}
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
 func smartForgotten(limit int) ([]fiber.Map, error) {
 	last := map[string]time.Time{}
 	if db != nil {
-		if rows, err := db.Query(ctx, `SELECT track_path, MAX(played_at) FROM listens GROUP BY track_path`); err == nil {
-			for rows.Next() {
-				var p string
-				var ts time.Time
-				if rows.Scan(&p, &ts) == nil {
-					last[p] = ts
-				}
+		qctx, cancel := dbCtx()
+		defer cancel()
+		rows, err := db.Query(qctx, `
+			SELECT track_path, MAX(played_at)
+			FROM listens
+			WHERE played_at IS NOT NULL
+			GROUP BY track_path`)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var p string
+			var ts time.Time
+			if err := rows.Scan(&p, &ts); err != nil {
+				return nil, err
 			}
-			rows.Close()
+			last[p] = ts
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
 		}
 	}
 	cutoff := time.Now().Add(-90 * 24 * time.Hour)
@@ -178,57 +287,77 @@ func smartWave(limit int) ([]fiber.Map, error) {
 	if db == nil {
 		return []fiber.Map{}, nil
 	}
+	qctx, cancel := dbCtx()
+	defer cancel()
+
 	// Последние 50 прослушиваний → любимые артисты/альбомы.
 	artists := map[string]bool{}
 	albums := map[string]bool{}
-	if rows, err := db.Query(ctx, `
+	rows, err := db.Query(qctx, `
 		SELECT COALESCE(artist,''), COALESCE(album,'') FROM listens
-		ORDER BY played_at DESC LIMIT 50`); err == nil {
-		for rows.Next() {
-			var a, al string
-			if rows.Scan(&a, &al) == nil {
-				if a != "" {
-					artists[a] = true
-				}
-				if al != "" {
-					albums[al] = true
-				}
-			}
-		}
-		rows.Close()
+		ORDER BY played_at DESC LIMIT 50`)
+	if err != nil {
+		return nil, err
 	}
+	for rows.Next() {
+		var a, al string
+		if err := rows.Scan(&a, &al); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if a != "" {
+			artists[strings.ToLower(strings.TrimSpace(a))] = true
+		}
+		if al != "" {
+			albums[strings.ToLower(strings.TrimSpace(al))] = true
+		}
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+
 	// Что слушали за 14 дней (исключаем).
 	recent := map[string]bool{}
-	if rows, err := db.Query(ctx, `SELECT DISTINCT track_path FROM listens WHERE played_at > NOW() - INTERVAL '14 days'`); err == nil {
-		for rows.Next() {
-			var p string
-			if rows.Scan(&p) == nil {
-				recent[p] = true
-			}
-		}
-		rows.Close()
+	rows, err = db.Query(qctx, `SELECT DISTINCT track_path FROM listens WHERE played_at > NOW() - INTERVAL '14 days'`)
+	if err != nil {
+		return nil, err
 	}
-	// Кандидаты: треки тех же артистов/альбомов (по пути), не слушанные 14+ дней.
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		recent[p] = true
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	// Кандидаты: треки тех же артистов/альбомов. Сравниваем компоненты пути
+	// целиком, а не подстроку: "AC/DC" и "The" иначе матчили не то.
 	pool := []fiber.Map{}
 	for _, f := range musicIndex() {
 		if recent[f.Path] {
 			continue
 		}
-		dir := filepath.Base(filepath.Dir(f.Path))
+		parts := strings.Split(strings.ToLower(f.Path), "/")
+		if len(parts) < 2 {
+			continue
+		}
 		match := false
-		for a := range artists {
-			if strings.Contains(f.Path, a) {
+		for _, seg := range parts[:len(parts)-1] {
+			if artists[seg] {
 				match = true
 				break
 			}
 		}
-		if !match {
-			for al := range albums {
-				if al != "" && dir == al {
-					match = true
-					break
-				}
-			}
+		if !match && albums[parts[len(parts)-2]] {
+			match = true
 		}
 		if match {
 			pool = append(pool, trackMap(f.Path, "", "", ""))
@@ -267,7 +396,7 @@ func listensRoutes(app *fiber.App) {
 			return c.Status(400).JSON(fiber.Map{"error": "unknown type"})
 		}
 		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+			return dbFail(c, "smart playlists", err)
 		}
 		return c.JSON(fiber.Map{"type": t, "tracks": tracks, "count": len(tracks)})
 	})
@@ -280,12 +409,14 @@ func listensRoutes(app *fiber.App) {
 		if v, err := strconv.Atoi(c.Query("limit", "100")); err == nil && v > 0 && v <= 1000 {
 			limit = v
 		}
-		rows, err := db.Query(ctx, `
+		qctx, cancel := context.WithTimeout(c.Context(), dbTimeout)
+		defer cancel()
+		rows, err := db.Query(qctx, `
 			SELECT track_path, COALESCE(artist,''), COALESCE(album,''), COALESCE(title,''),
 			       COALESCE(duration_sec,0), completed, played_at
 			FROM listens ORDER BY played_at DESC LIMIT $1`, limit)
 		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+			return dbFail(c, "listens", err)
 		}
 		defer rows.Close()
 		out := []fiber.Map{}
@@ -299,6 +430,9 @@ func listensRoutes(app *fiber.App) {
 					"duration_sec": dur, "completed": completed, "played_at": at})
 			}
 		}
+		if err := rows.Err(); err != nil {
+			return dbFail(c, "listens rows", err)
+		}
 		return c.JSON(fiber.Map{"listens": out, "count": len(out)})
 	})
 
@@ -310,36 +444,53 @@ func listensRoutes(app *fiber.App) {
 		if v, err := strconv.Atoi(c.Query("days", "30")); err == nil && v > 0 && v <= 365 {
 			days = v
 		}
-		rows, err := db.Query(ctx, `
+		qctx, cancel := context.WithTimeout(c.Context(), dbTimeout)
+		defer cancel()
+		rows, err := db.Query(qctx, `
 			SELECT TO_CHAR(DATE(played_at),'YYYY-MM-DD'), COUNT(*),
-			       COALESCE(SUM(duration_sec),0)/3600
+			       COALESCE(SUM(duration_sec),0)::float8/3600
 			FROM listens
 			WHERE played_at > NOW() - make_interval(days => $1)
 			GROUP BY DATE(played_at) ORDER BY 1`, days)
 		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+			return dbFail(c, "daily stats", err)
 		}
 		defer rows.Close()
 		out := []fiber.Map{}
 		for rows.Next() {
 			var d string
-			var cnt, hours int
+			var cnt int
+			var hours float64
 			if rows.Scan(&d, &cnt, &hours) == nil {
-				out = append(out, fiber.Map{"date": d, "count": cnt, "hours": hours})
+				out = append(out, fiber.Map{"date": d, "count": cnt,
+					"hours": math.Round(hours*10) / 10})
 			}
+		}
+		if err := rows.Err(); err != nil {
+			return dbFail(c, "daily stats rows", err)
 		}
 		return c.JSON(fiber.Map{"days": days, "data": out})
 	})
 
-	app.Get("/listens/stats/hourly", func(c fiber.Ctx) error {
+	// hourly и heatmap — одна и та же матрица 7×24; регистрируем один обработчик.
+	heatmap := func(c fiber.Ctx) error {
 		if db == nil {
 			return c.Status(503).JSON(fiber.Map{"error": "БД недоступна"})
 		}
-		rows, err := db.Query(ctx, `
-			SELECT EXTRACT(DOW FROM played_at)::int, EXTRACT(HOUR FROM played_at)::int, COUNT(*)
-			FROM listens GROUP BY 1,2`)
+		days := 365
+		if v, err := strconv.Atoi(c.Query("days", "365")); err == nil && v > 0 && v <= 3650 {
+			days = v
+		}
+		qctx, cancel := context.WithTimeout(c.Context(), dbTimeout)
+		defer cancel()
+		rows, err := db.Query(qctx, `
+			SELECT ((EXTRACT(DOW FROM played_at)::int + 6) % 7),
+			       EXTRACT(HOUR FROM played_at)::int, COUNT(*)
+			FROM listens
+			WHERE played_at > NOW() - make_interval(days => $1)
+			GROUP BY 1,2`, days)
 		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+			return dbFail(c, "heatmap", err)
 		}
 		defer rows.Close()
 		grid := make([][]int, 7)
@@ -352,22 +503,40 @@ func listensRoutes(app *fiber.App) {
 				grid[dow][hour] = cnt
 			}
 		}
-		return c.JSON(fiber.Map{"data": grid})
-	})
+		if err := rows.Err(); err != nil {
+			return dbFail(c, "heatmap rows", err)
+		}
+		return c.JSON(fiber.Map{"days": days, "data": grid})
+	}
+	app.Get("/listens/stats/hourly", heatmap)
 
+	// Белый список колонок: field приходит из кода, но не должен попадать в SQL.
+	statsTopFields := map[string]string{"artist": "artist", "album": "album", "title": "title"}
 	statsTop := func(field string) fiber.Handler {
+		col, ok := statsTopFields[field]
+		if !ok {
+			panic("statsTop: unknown field " + field)
+		}
 		return func(c fiber.Ctx) error {
 			if db == nil {
 				return c.Status(503).JSON(fiber.Map{"error": "БД недоступна"})
 			}
-			days := periodDays(c.Query("period", "month"))
-			rows, err := db.Query(ctx, `
-				SELECT COALESCE(NULLIF(`+field+`,''),'?') AS name, COUNT(*) AS cnt
+			period := c.Query("period", "month")
+			switch period {
+			case "week", "month", "year":
+			default:
+				period = "month"
+			}
+			days := periodDays(period)
+			qctx, cancel := context.WithTimeout(c.Context(), dbTimeout)
+			defer cancel()
+			rows, err := db.Query(qctx, `
+				SELECT COALESCE(NULLIF(`+col+`,''),'?') AS name, COUNT(*) AS cnt
 				FROM listens
 				WHERE played_at > NOW() - make_interval(days => $1)
 				GROUP BY name ORDER BY cnt DESC LIMIT 10`, days)
 			if err != nil {
-				return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+				return dbFail(c, "stats top", err)
 			}
 			defer rows.Close()
 			out := []fiber.Map{}
@@ -378,7 +547,10 @@ func listensRoutes(app *fiber.App) {
 					out = append(out, fiber.Map{"name": name, "count": cnt})
 				}
 			}
-			return c.JSON(fiber.Map{"period": c.Query("period", "month"), "items": out})
+			if err := rows.Err(); err != nil {
+				return dbFail(c, "stats top rows", err)
+			}
+			return c.JSON(fiber.Map{"period": period, "items": out})
 		}
 	}
 	app.Get("/listens/stats/artists", statsTop("artist"))
@@ -389,11 +561,19 @@ func listensRoutes(app *fiber.App) {
 		if db == nil {
 			return c.Status(503).JSON(fiber.Map{"error": "БД недоступна"})
 		}
-		rows, err := db.Query(ctx, `
+		days := 1825
+		if v, err := strconv.Atoi(c.Query("days", "1825")); err == nil && v > 0 && v <= 36500 {
+			days = v
+		}
+		qctx, cancel := context.WithTimeout(c.Context(), dbTimeout)
+		defer cancel()
+		rows, err := db.Query(qctx, `
 			SELECT TO_CHAR(DATE_TRUNC('month', played_at),'YYYY-MM'), COUNT(*)
-			FROM listens GROUP BY DATE_TRUNC('month', played_at) ORDER BY 1`)
+			FROM listens
+			WHERE played_at > NOW() - make_interval(days => $1)
+			GROUP BY DATE_TRUNC('month', played_at) ORDER BY 1`, days)
 		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+			return dbFail(c, "yearly stats", err)
 		}
 		defer rows.Close()
 		out := []fiber.Map{}
@@ -404,54 +584,47 @@ func listensRoutes(app *fiber.App) {
 				out = append(out, fiber.Map{"month": m, "count": cnt})
 			}
 		}
+		if err := rows.Err(); err != nil {
+			return dbFail(c, "yearly stats rows", err)
+		}
 		return c.JSON(fiber.Map{"data": out})
 	})
 
-	app.Get("/listens/stats/heatmap", func(c fiber.Ctx) error {
-		if db == nil {
-			return c.Status(503).JSON(fiber.Map{"error": "БД недоступна"})
-		}
-		rows, err := db.Query(ctx, `
-			SELECT EXTRACT(DOW FROM played_at)::int, EXTRACT(HOUR FROM played_at)::int, COUNT(*)
-			FROM listens GROUP BY 1,2`)
-		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
-		}
-		defer rows.Close()
-		grid := make([][]int, 7)
-		for i := range grid {
-			grid[i] = make([]int, 24)
-		}
-		for rows.Next() {
-			var dow, hour, cnt int
-			if rows.Scan(&dow, &hour, &cnt) == nil && dow >= 0 && dow < 7 && hour >= 0 && hour < 24 {
-				grid[dow][hour] = cnt
-			}
-		}
-		return c.JSON(fiber.Map{"data": grid})
-	})
+	app.Get("/listens/stats/heatmap", heatmap)
 
 	app.Get("/listens/stats/compare", func(c fiber.Ctx) error {
 		if db == nil {
 			return c.Status(503).JSON(fiber.Map{"error": "БД недоступна"})
 		}
+		qctx, cancel := context.WithTimeout(c.Context(), dbTimeout)
+		defer cancel()
 		var cur, prev int
-		_ = db.QueryRow(ctx, `SELECT COUNT(*) FROM listens WHERE played_at > NOW() - INTERVAL '30 days'`).Scan(&cur)
-		_ = db.QueryRow(ctx, `SELECT COUNT(*) FROM listens WHERE played_at BETWEEN NOW() - INTERVAL '60 days' AND NOW() - INTERVAL '30 days'`).Scan(&prev)
-		delta := 0
+		if err := db.QueryRow(qctx, `SELECT COUNT(*) FROM listens WHERE played_at > NOW() - INTERVAL '30 days'`).Scan(&cur); err != nil {
+			return dbFail(c, "compare current", err)
+		}
+		if err := db.QueryRow(qctx, `SELECT COUNT(*) FROM listens WHERE played_at BETWEEN NOW() - INTERVAL '60 days' AND NOW() - INTERVAL '30 days'`).Scan(&prev); err != nil {
+			return dbFail(c, "compare previous", err)
+		}
+		delta := 0.0
 		if prev > 0 {
-			delta = (cur - prev) * 100 / prev
+			delta = math.Round(float64(cur-prev)*1000/float64(prev)) / 10
 		}
 		return c.JSON(fiber.Map{"current_30d": cur, "previous_30d": prev, "delta_percent": delta})
 	})
 
 	app.Delete("/listens", func(c fiber.Ctx) error {
+		if c.Query("confirm") != "yes" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "confirm=yes required"})
+		}
 		if db == nil {
 			return c.Status(503).JSON(fiber.Map{"error": "БД недоступна"})
 		}
-		if _, err := db.Exec(ctx, `DELETE FROM listens`); err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		qctx, cancel := context.WithTimeout(c.Context(), 30*time.Second)
+		defer cancel()
+		if _, err := db.Exec(qctx, `DELETE FROM listens`); err != nil {
+			return dbFail(c, "clear listens", err)
 		}
+		log.Printf("listens: history cleared by %s", c.IP())
 		return c.JSON(fiber.Map{"status": "cleared"})
 	})
 }
@@ -467,33 +640,115 @@ func periodDays(p string) int {
 	}
 }
 
+// clampTag нормализует тег: валидный UTF-8, без управляющих символов,
+// не длиннее max рун.
+func clampTag(s string) string {
+	s = strings.ToValidUTF8(s, "?")
+	s = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, s)
+	s = strings.TrimSpace(s)
+	if r := []rune(s); len(r) > 512 {
+		s = strings.TrimSpace(string(r[:512]))
+	}
+	return s
+}
+
+// cleanListenPath: только путь внутри библиотеки, без схем, управляющих
+// символов и выхода за MUSIC_DIR.
+func cleanListenPath(p string) (string, bool) {
+	if p == "" || len(p) > 4096 || strings.Contains(p, "://") ||
+		strings.ContainsAny(p, "\r\n\x00") {
+		return "", false
+	}
+	clean := filepath.ToSlash(filepath.Clean(filepath.FromSlash(p)))
+	if filepath.IsAbs(filepath.FromSlash(clean)) {
+		return relMusicPath(clean)
+	}
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") {
+		return "", false
+	}
+	return clean, true
+}
+
+// isIgnoredTrack отбрасывает служебные файлы и каталоги, но не альбомы
+// вроде "Testament", "Greatest Hits" или "Contest": сравниваем компоненты
+// пути, а не подстроку в названии.
+func isIgnoredTrack(rel string) bool {
+	parts := strings.Split(strings.ToLower(filepath.ToSlash(rel)), "/")
+	for _, p := range parts {
+		switch p {
+		case "test", "tests", "sample", "samples", "preview", "previews", "temp", "tmp":
+			return true
+		}
+		if strings.HasPrefix(p, "test_") || strings.HasPrefix(p, "sample_") ||
+			strings.HasPrefix(p, "preview_") || strings.HasSuffix(p, ".tmp") ||
+			strings.HasPrefix(p, ".") {
+			return true
+		}
+	}
+	base := strings.TrimSuffix(parts[len(parts)-1], filepath.Ext(parts[len(parts)-1]))
+	switch base {
+	case "test", "sample", "preview":
+		return true
+	}
+	return false
+}
+
 // recordListen пишет старт трека в историю и возвращает id записи.
 func recordListen(file, artist, album, title string, duration float64, prevID int64, prevElapsed, prevDuration float64) int64 {
-	if db == nil || file == "" {
+	if db == nil {
 		return 0
 	}
-	// Только музыкальные файлы (исключаем видео и пр.).
-	if !audioExtsSmart[strings.ToLower(filepath.Ext(file))] {
+	qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	// Закрываем предыдущее прослушивание ДО фильтрации текущего: пропуск
+	// служебного файла не должен навсегда оставить completed=false.
+	if prevID > 0 && prevDuration > 0 && prevElapsed >= 0.9*prevDuration {
+		if _, err := db.Exec(qctx,
+			`UPDATE listens SET completed=true WHERE id=$1 AND completed=false`, prevID); err != nil {
+			log.Printf("listens: mark completed %d: %v", prevID, err)
+		}
+	}
+
+	rel, ok := cleanListenPath(file)
+	if !ok {
 		return 0
 	}
-	base := filepath.Base(file)
-	low := strings.ToLower(base)
-	if strings.Contains(low, "test") || strings.Contains(low, "sample") {
+	// Только музыкальные файлы (исключаем видео и пр.) и не служебные.
+	if !audioExts[strings.ToLower(filepath.Ext(rel))] || isIgnoredTrack(rel) {
 		return 0
 	}
 	// Fallback заголовка из имени файла.
-	if strings.TrimSpace(title) == "" {
+	artist, album, title = clampTag(artist), clampTag(album), clampTag(title)
+	base := filepath.Base(rel)
+	if title == "" {
 		title = strings.TrimSuffix(base, filepath.Ext(base))
 	}
-	if prevID > 0 && prevDuration > 0 && prevElapsed >= 0.9*prevDuration {
-		_, _ = db.Exec(ctx, `UPDATE listens SET completed=true WHERE id=$1`, prevID)
+	dur := 0
+	if !math.IsNaN(duration) && !math.IsInf(duration, 0) && duration >= 0 && duration <= 24*3600 {
+		dur = int(duration)
 	}
+
+	// Окно дедупликации: повторный play/seek того же файла (рестарт,
+	// возврат назад) не создаёт вторую строку.
 	var id int64
-	err := db.QueryRow(ctx, `
+	err := db.QueryRow(qctx, `
 		INSERT INTO listens (track_path, artist, album, title, duration_sec)
-		VALUES ($1,$2,$3,$4,$5) RETURNING id`,
-		file, strings.ToValidUTF8(artist, "?"), strings.ToValidUTF8(album, "?"),
-		strings.ToValidUTF8(title, "?"), int(duration)).Scan(&id)
+		SELECT $1,$2,$3,$4,$5
+		WHERE NOT EXISTS (
+			SELECT 1 FROM listens
+			WHERE track_path = $1 AND played_at > NOW() - INTERVAL '60 seconds'
+		)
+		RETURNING id`,
+		rel, artist, album, title, dur).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0 // окно дедупликации — не ошибка
+	}
 	if err != nil {
 		log.Printf("⚠️ listens insert: %v", err)
 		return 0

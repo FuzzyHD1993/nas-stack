@@ -8,7 +8,7 @@ import (
 
 // GetEnv возвращает переменную окружения или значение по умолчанию.
 func GetEnv(key, def string) string {
-	if v := os.Getenv(key); v != "" {
+	if v := os.Getenv(key); strings.TrimSpace(v) != "" {
 		return v
 	}
 	return def

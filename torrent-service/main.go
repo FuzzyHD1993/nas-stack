@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -19,6 +20,7 @@ import (
 	"github.com/FuzzyHD1993/nas-stack/internal/platform"
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/middleware/adaptor"
+	"github.com/gofiber/fiber/v3/middleware/recover"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/text/encoding/charmap"
@@ -27,6 +29,9 @@ import (
 var (
 	rdb *redis.Client
 	ctx = context.Background()
+
+	// Все запросы к NAS — с таймаутом: http.Get/PostForm по умолчанию висят вечно.
+	nasHTTP = &http.Client{Timeout: 30 * time.Second}
 )
 
 func main() {
@@ -37,9 +42,30 @@ func main() {
 		Addr: platform.GetEnv("REDIS_ADDR", "localhost:6379"),
 	})
 
-	app := fiber.New()
+	app := fiber.New(fiber.Config{
+		BodyLimit:    1 << 20,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 70 * time.Second,
+		IdleTimeout:  60 * time.Second,
+		ErrorHandler: func(c fiber.Ctx, err error) error {
+			code := fiber.StatusInternalServerError
+			var fe *fiber.Error
+			if errors.As(err, &fe) {
+				code = fe.Code
+			} else {
+				log.Printf("http: %v", err)
+			}
+			msg := http.StatusText(code)
+			if msg == "" {
+				msg = "error"
+			}
+			return c.Status(code).JSON(fiber.Map{"error": msg})
+		},
+	})
 	platform.StartPprof()
+	// metrics ДО recover: паника должна попасть в метрики как 500.
 	app.Use(metricsMiddleware())
+	app.Use(recover.New())
 
 	app.Get("/metrics", adaptor.HTTPHandler(promhttp.Handler()))
 
@@ -86,35 +112,54 @@ func main() {
 			Destination string `json:"destination"`
 		}
 		if err := c.Bind().JSON(&body); err != nil {
-			return c.Status(400).JSON(fiber.Map{"error": "invalid body"})
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
 		}
 		if body.Magnet == "" && body.TorrentURL == "" {
-			return c.Status(400).JSON(fiber.Map{"error": "нужен magnet или torrentUrl"})
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "нужен magnet или torrentUrl"})
 		}
 
-		var readable string
+		var magnet, torrentURL string
 		if body.Magnet != "" {
-			readable = magnetName(body.Magnet)
+			m, err := validateMagnet(body.Magnet)
+			if err != nil {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid magnet"})
+			}
+			magnet = m
 		} else {
-			readable = fileNameFromURL(body.TorrentURL)
+			u, err := validateTorrentURL(body.TorrentURL)
+			if err != nil {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid torrentUrl"})
+			}
+			torrentURL = u.String()
+		}
+
+		readable := magnetName(magnet)
+		if magnet == "" {
+			readable = fileNameFromURL(torrentURL)
 		}
 
 		dest := ""
 		autoDetected := false
 		if body.Destination != "" {
-			dest = resolveDestination(body.Destination)
+			d, err := resolveDestination(body.Destination)
+			if err != nil {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid destination"})
+			}
+			dest = d
 		} else {
 			dest = guessDestination(readable)
 			autoDetected = true
 		}
 
-		if body.Magnet != "" {
-			if err := addMagnetToNAS(body.Magnet, dest); err != nil {
-				return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		if magnet != "" {
+			if err := addMagnetToNAS(magnet, dest); err != nil {
+				log.Printf("add magnet: %v", err)
+				return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "failed to add torrent"})
 			}
 		} else {
-			if err := addTorrentURLToNAS(body.TorrentURL, dest); err != nil {
-				return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+			if err := addTorrentURLToNAS(c.Context(), torrentURL, dest); err != nil {
+				log.Printf("add torrent url: %v", err)
+				return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "failed to add torrent"})
 			}
 		}
 
@@ -266,18 +311,71 @@ func main() {
 // resolveDestination превращает ключ назначения в путь на NAS:
 //
 //	"music" -> TORRENT_DESTINATION_MUSIC, "video" -> TORRENT_DESTINATION_VIDEO,
-//	пусто   -> TORRENT_DESTINATION (совместимость), иначе — путь как есть.
-func resolveDestination(dest string) string {
+//	пусто   -> TORRENT_DESTINATION (совместимость), иначе — только путь из
+//	allowlist TORRENT_DESTINATIONS/TORRENT_DESTINATION*.
+func resolveDestination(dest string) (string, error) {
+	dest = strings.TrimSpace(dest)
 	switch strings.ToLower(dest) {
-	case "music":
-		return platform.GetEnv("TORRENT_DESTINATION_MUSIC", "homes/FuzzyHD/Music")
-	case "video":
-		return platform.GetEnv("TORRENT_DESTINATION_VIDEO", "homes/FuzzyHD/Video")
 	case "":
-		return platform.GetEnv("TORRENT_DESTINATION", "homes/FuzzyHD/Music")
-	default:
-		return dest
+		return platform.GetEnv("TORRENT_DESTINATION", "homes/FuzzyHD/Music"), nil
+	case "music":
+		return platform.GetEnv("TORRENT_DESTINATION_MUSIC", "homes/FuzzyHD/Music"), nil
+	case "video":
+		return platform.GetEnv("TORRENT_DESTINATION_VIDEO", "homes/FuzzyHD/Video"), nil
 	}
+	if !validDestination(dest) {
+		return "", errors.New("invalid destination")
+	}
+	return dest, nil
+}
+
+// validDestination — allowlist из TORRENT_DESTINATIONS/TORRENT_DESTINATION*.
+// Запрещает абсолютные пути, "..", управляющие символы и произвольные NAS-пути.
+func validDestination(dest string) bool {
+	if dest == "" || len(dest) > 512 || strings.HasPrefix(dest, "/") || strings.Contains(dest, "..") {
+		return false
+	}
+	for _, r := range dest {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	for _, p := range allowedDestinations() {
+		if p == dest {
+			return true
+		}
+	}
+	return false
+}
+
+func allowedDestinations() []string {
+	raw := []string{
+		platform.GetEnv("TORRENT_DESTINATIONS", ""),
+		platform.GetEnv("TORRENT_DESTINATION", "homes/FuzzyHD/Music"),
+		platform.GetEnv("TORRENT_DESTINATION_MUSIC", "homes/FuzzyHD/Music"),
+		platform.GetEnv("TORRENT_DESTINATION_VIDEO", "homes/FuzzyHD/Video"),
+		platform.GetEnv("TORRENT_DESTINATION_TV", "homes/FuzzyHD/TV"),
+		platform.GetEnv("TORRENT_DESTINATION_MOVIES", "homes/FuzzyHD/Movies"),
+		platform.GetEnv("TORRENT_DESTINATION_GAMES", "homes/FuzzyHD/Games"),
+		platform.GetEnv("TORRENT_DESTINATION_COURSES", "homes/FuzzyHD/Courses"),
+		platform.GetEnv("TORRENT_DESTINATION_BOOKS", "homes/FuzzyHD/Books"),
+	}
+	var out []string
+	seen := make(map[string]struct{})
+	for _, group := range raw {
+		for _, p := range strings.Split(group, ",") {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			if _, ok := seen[p]; ok {
+				continue
+			}
+			seen[p] = struct{}{}
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 var (
@@ -342,7 +440,7 @@ func getSID() (string, error) {
 		"http://%s:5000/webapi/auth.cgi?api=SYNO.API.Auth&version=7&method=login&account=%s&passwd=%s&session=DownloadStation&format=sid",
 		host, user, url.QueryEscape(pass),
 	)
-	resp, err := http.Get(loginURL)
+	resp, err := nasHTTP.Get(loginURL)
 	if err != nil {
 		return "", fmt.Errorf("login failed: %w", err)
 	}
@@ -367,7 +465,7 @@ func getDSConfig() (fiber.Map, error) {
 		"http://%s:5000/webapi/DownloadStation/info.cgi?api=SYNO.DownloadStation.Info&version=1&method=getconfig&_sid=%s",
 		host, sid,
 	)
-	resp, err := http.Get(u)
+	resp, err := nasHTTP.Get(u)
 	if err != nil {
 		return nil, err
 	}
@@ -412,7 +510,7 @@ func setDSConfig(maxDownload int) error {
 		"_sid":              {sid},
 		"http_max_download": {strconv.Itoa(maxDownload)},
 	}
-	resp, err := http.PostForm(fmt.Sprintf("http://%s:5000/webapi/DownloadStation/info.cgi", host), form)
+	resp, err := nasHTTP.PostForm(fmt.Sprintf("http://%s:5000/webapi/DownloadStation/info.cgi", host), form)
 	if err != nil {
 		return err
 	}
@@ -447,7 +545,7 @@ func addMagnetToNAS(magnet, dest string) error {
 		"destination": {dest},
 		"_sid":        {sid},
 	}
-	resp, err := http.PostForm(addURL, data)
+	resp, err := nasHTTP.PostForm(addURL, data)
 	if err != nil {
 		return fmt.Errorf("add failed: %w", err)
 	}
@@ -464,42 +562,15 @@ func addMagnetToNAS(magnet, dest string) error {
 //   - 1337x отдаёт magnet через 301-редирект — достаём magnet и добавляем через uri
 //   - иначе .torrent-файл — переписываем host.containers.internal на LAN-IP хоста
 //     и отдаём NAS на скачивание (multipart-upload .torrent на DSM 7.2 возвращает 101)
-func addTorrentURLToNAS(torrentURL, dest string) error {
-	if magnet := resolveMagnet(torrentURL); magnet != "" {
+func addTorrentURLToNAS(rctx context.Context, torrentURL, dest string) error {
+	u, err := validateTorrentURL(torrentURL)
+	if err != nil {
+		return err
+	}
+	if magnet := resolveMagnet(rctx, u.String()); magnet != "" {
 		return addMagnetToNAS(magnet, dest)
 	}
-	return addMagnetToNAS(rewriteHost(torrentURL), dest)
-}
-
-// resolveMagnet возвращает magnet-ссылку, если torrentUrl ведёт на magnet (301-редирект)
-func resolveMagnet(torrentURL string) string {
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if strings.HasPrefix(req.URL.String(), "magnet:") {
-				return http.ErrUseLastResponse
-			}
-			return nil
-		},
-	}
-	resp, err := client.Get(torrentURL)
-	if err != nil {
-		return ""
-	}
-	defer resp.Body.Close()
-	if loc := resp.Header.Get("Location"); strings.HasPrefix(loc, "magnet:") {
-		return loc
-	}
-	return ""
-}
-
-// rewriteHost заменяет host.containers.internal на LAN-IP хоста (доступный для NAS)
-func rewriteHost(rawURL string) string {
-	hostIP := platform.GetEnv("HOST_IP", "")
-	if hostIP == "" {
-		return rawURL
-	}
-	return strings.Replace(rawURL, "host.containers.internal", hostIP, 1)
+	return addMagnetToNAS(rewriteHost(u), dest)
 }
 
 // magnetName извлекает читаемое имя (последний dn=) из magnet-ссылки, иначе btih-хеш
@@ -551,7 +622,7 @@ func listTasks() ([]map[string]interface{}, error) {
 		"http://%s:5000/webapi/DownloadStation/task.cgi?api=SYNO.DownloadStation.Task&version=1&method=list&additional=detail,transfer,tracker,file&_sid=%s",
 		host, sid,
 	)
-	resp, err := http.Get(listURL)
+	resp, err := nasHTTP.Get(listURL)
 	if err != nil {
 		return nil, err
 	}
@@ -692,7 +763,7 @@ func taskAction(method, id string) error {
 		"id":      {id},
 		"_sid":    {sid},
 	}
-	resp, err := http.PostForm(actionURL, data)
+	resp, err := nasHTTP.PostForm(actionURL, data)
 	if err != nil {
 		return err
 	}

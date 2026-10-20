@@ -25,6 +25,35 @@ func TestSafeMusicPath(t *testing.T) {
 	}
 }
 
+func TestSafeMusicPathSymlinkEscape(t *testing.T) {
+	base := t.TempDir()
+	outside := t.TempDir()
+	t.Setenv("MUSIC_DIR", base)
+
+	if err := os.WriteFile(filepath.Join(outside, "secret.flac"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "secret.flac"), filepath.Join(base, "evil.flac")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	if _, ok := safeMusicFile("evil.flac"); ok {
+		t.Fatal("symlink outside MUSIC_DIR accepted")
+	}
+
+	if err := os.Mkdir(filepath.Join(base, "Album"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "Album", "ok.flac"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := safeMusicFile("Album/ok.flac"); !ok {
+		t.Fatal("regular file rejected")
+	}
+	if _, ok := safeMusicFile("Album"); ok {
+		t.Fatal("directory accepted as audio file")
+	}
+}
+
 func TestBrowserAlbums(t *testing.T) {
 	base := t.TempDir()
 	dir := filepath.Join(base, "Deep Purple", "Machine Head")

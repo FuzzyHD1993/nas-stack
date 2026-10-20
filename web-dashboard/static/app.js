@@ -65,7 +65,8 @@ let authToken = storeGet('jwt_token') || null;
 
 // ==================== ADMIN TOKEN (host-exec ручки) ====================
 // ADMIN_TOKEN из .env нужен для ручек с побочными эффектами на хосте:
-// /api/notify/update/*, /api/notify/env*, /api/scheduler/update/run.
+// /api/notify/update/*, /api/notify/env*, /api/scheduler/update/*,
+// /api/scheduler/backup/*, /api/stats/cleanup/run, /api/media/open|rename|duplicates.
 // Хранится в localStorage и отправляется как 'Authorization: Bearer ...'.
 // Отдельный от JWT: apiFetch подставляет jwt_token и перетирал бы админ-токен,
 // поэтому админ-вызовы идут через adminFetch (обычный fetch + adminHeaders).
@@ -218,7 +219,7 @@ const COMMANDS = [
     {id: 'theme-auto', label: '🌗 Тема: Авто', action: () => changeTheme('auto')},
     {id: 'scan-media', label: '🔄 Сканировать медиа', action: () => { showTab('media'); const b = document.querySelector('.media-controls button'); if (b) scanMedia({target: b}); }},
     {id: 'search-media', label: '🔍 Глобальный поиск', action: openGlobalSearch},
-    {id: 'sync-credits', label: '🎭 Загрузить актёров', action: () => { fetch('/api/media/scan/credits', {method: 'POST'}).then(() => notify('🎭 Загрузка актёров запущена')); }},
+    {id: 'sync-credits', label: '🎭 Загрузить актёров', action: () => { adminFetch('/api/media/scan/credits', {method: 'POST'}).then(() => notify('🎭 Загрузка актёров запущена')); }},
     {id: 'export-settings', label: '📥 Экспорт настроек', action: exportSettings},
     {id: 'logout', label: '🔓 Выйти', action: doLogout},
 ];
@@ -397,7 +398,7 @@ async function resolveDup(tmdbId) {
         return;
     }
     try {
-        await apiFetch('/api/media/duplicates/resolve', {
+        await adminFetch('/api/media/duplicates/resolve', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({tmdb_id: tmdbId, keep_id: keepId, delete_ids: deleteIds})
         });
@@ -746,7 +747,7 @@ function getDateGroup(dateStr) {
 }
 
 function escapeHtml(s) {
-    return (s || '')
+    return String(s == null ? '' : s)
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
@@ -1233,7 +1234,7 @@ async function renamePreviewById(id) {
 async function renameApply(id) {
     if (!confirm('Применить переименование?')) return;
     try {
-        const r = await apiFetch('/api/media/rename/apply', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id})});
+        const r = await adminFetch('/api/media/rename/apply', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id})});
         const d = await r.json();
         if (d.error) { notify('❌ ' + d.error, true); return; }
         notify('✏️ Переименовано');
@@ -1359,11 +1360,11 @@ async function loadSmartPlaylist(type) {
         if (!tracks.length) { el.innerHTML = '<div class="loading">Пусто (послушайте музыку, чтобы набрать статистику)</div>'; return; }
         let html = '<div class="album-tracks">';
         tracks.forEach(t => {
-            const f = (t.track_path || '').replace(/'/g, "\\'");
-            html += '<div class="album-track" onclick="musicPlayFile(\'' + f + '\')">';
-            html += '<span class="track-title">' + escapeHtml(t.title || (t.track_path || '').split('/').pop()) + '</span>';
-            html += '<span class="track-duration">' + escapeHtml(t.artist || '') + (t.count ? ' · ' + t.count : '') + '</span>';
-            html += '<span class="track-actions">' + addPlBtn(t.track_path) + '</span>';
+            const f = String(t.track_path || '');
+            html += '<div class="album-track" data-music-action="play-file" data-file="' + escAttr(f) + '">';
+            html += '<span class="track-title">' + escapeHtml(t.title || f.split('/').pop()) + '</span>';
+            html += '<span class="track-duration">' + escapeHtml(t.artist || '') + (t.count ? ' · ' + escapeHtml(t.count) : '') + '</span>';
+            html += '<span class="track-actions">' + addPlBtn(f) + '</span>';
             html += '</div>';
         });
         html += '</div>';
@@ -1629,22 +1630,25 @@ async function loadBackups() {
             if (!arr.length) return;
             html += '<h4 style="color:var(--accent);margin:8px 0 4px;">' + t + ' (' + arr.length + ')</h4><div class="history-list">';
             arr.forEach(b => {
-                const safe = String(b.file).replace(/'/g, "\\'");
+                const displayName = b.name || b.file;
                 html += '<div class="history-item">' +
-                    '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escapeHtml(b.file) + '</span>' +
+                    '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escapeHtml(displayName) + '</span>' +
                     '<span>' + formatSize(b.size_bytes) + '</span>' +
-                    '<button onclick="restoreBackup(\'' + safe + '\')" style="margin-left:8px;">↩️</button>' +
+                    '<button class="restore-btn" data-file="' + escapeHtml(b.file) + '" style="margin-left:8px;">↩️</button>' +
                     '</div>';
             });
             html += '</div>';
         });
         el.innerHTML = html || '<div style="color:var(--fg-dim);">Бэкапов нет</div>';
+        el.querySelectorAll('.restore-btn').forEach(btn => {
+            btn.addEventListener('click', () => restoreBackup(btn.dataset.file));
+        });
     } catch (e) { el.innerHTML = '<div class="error">Ошибка: ' + escapeHtml(e.message) + '</div>'; }
 }
 
 async function runBackup() {
     try {
-        await apiFetch('/api/scheduler/backup/run', {method: 'POST'});
+        await adminFetch('/api/scheduler/backup/run', {method: 'POST'});
         notify('💾 Бэкап запущен');
         setTimeout(loadBackups, 5000);
     } catch (e) { notify('❌ ' + e.message, true); }
@@ -1653,7 +1657,7 @@ async function runBackup() {
 async function restoreBackup(file) {
     if (!confirm('Восстановить ' + file + '?\n\n⚠️ Это перезапишет текущие данные БД!')) return;
     try {
-        const r = await apiFetch('/api/scheduler/backup/restore', {
+        const r = await adminFetch('/api/scheduler/backup/restore', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({file: file, confirm: true})
@@ -1691,7 +1695,7 @@ async function runCleanup() {
     const btn = document.getElementById('cleanup-btn');
     btn.disabled = true; btn.textContent = '🧹 Чищу...';
     try {
-        const r = await apiFetch('/api/stats/cleanup/run?dry=false', {
+        const r = await adminFetch('/api/stats/cleanup/run?dry=false', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({targets: ['podman_images', 'journald', 'cache', 'trash', 'pacman_cache']})
@@ -1742,14 +1746,24 @@ async function loadEnv() {
                 '<span style="min-width:180px;font-family:monospace;font-size:12px;">' + escapeHtml(v.key) + '</span>' +
                 '<input type="text" data-envkey="' + escapeHtml(v.key) + '" value="' + (masked ? '' : escapeHtml(v.value)) + '"' +
                 (masked ? ' placeholder="*** (скрыт)" disabled' : '') + ' style="flex:1;">' +
-                (masked ? '<button data-edit-secret="1" title="Изменить секрет" onclick="editEnvSecret(\'' + escapeHtml(v.key) + '\')">✏️</button>' : '') +
-                '<button onclick="saveEnv(\'' + escapeHtml(v.key) + '\')">💾</button></div>';
+                (masked ? '<button type="button" data-edit-secret="1" data-env-key="' + escapeHtml(v.key) + '" title="Изменить секрет">✏️</button>' : '') +
+                '<button type="button" data-env-save="' + escapeHtml(v.key) + '">💾</button></div>';
         });
         el.innerHTML = html || '<div class="loading">Нет переменных</div>';
+        el.querySelectorAll('button[data-env-save]').forEach(b =>
+            b.addEventListener('click', () => saveEnv(b.dataset.envSave)));
+        el.querySelectorAll('button[data-edit-secret]').forEach(b =>
+            b.addEventListener('click', () => editEnvSecret(b.dataset.envKey)));
     } catch (e) { el.innerHTML = '<div class="error">Ошибка: ' + e.message + '</div>'; }
 }
+// envInput — поиск по data-атрибуту без CSS-селектора: ключ из .env не может
+// инъецировать кавычку/скобку в querySelector.
+function envInput(key) {
+    return Array.from(document.querySelectorAll('input[data-envkey]'))
+        .find(i => i.dataset.envkey === key) || null;
+}
 function editEnvSecret(key) {
-    const input = document.querySelector('input[data-envkey="' + key + '"]');
+    const input = envInput(key);
     if (!input) return;
     input.disabled = false;
     input.value = '';
@@ -1759,7 +1773,7 @@ function editEnvSecret(key) {
     if (row) { const b = row.querySelector('button[data-edit-secret]'); if (b) b.remove(); }
 }
 async function saveEnv(key) {
-    const input = document.querySelector('input[data-envkey="' + key + '"]');
+    const input = envInput(key);
     if (!input) return;
     if (input.disabled) { notify('Секрет скрыт — нажмите ✏️, чтобы изменить', true); return; }
     if (input.value === '' ) { notify('Пустое значение — пропуск', true); return; }
@@ -2021,17 +2035,40 @@ async function loadBrowserAlbums() {
         const cnt = document.getElementById('music-albums-count');
         if (cnt) cnt.textContent = '(' + albums.length + ')';
         if (!albums.length) { grid.innerHTML = '<div class="loading">Музыка не найдена в MUSIC_DIR</div>'; return; }
-        let html = '';
+        grid.replaceChildren();
         albums.forEach(a => {
-            const dir = String(a.dir || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-            const alb = String(a.album || '').replace(/'/g, "\\'");
-            html += '<div class="album-card" onclick="openBrowserAlbum(\'' + dir + '\',\'' + alb + '\')">' +
-                '<img class="music-album-cover" src="' + browserCoverURL(a.artist, a.album) + '" loading="lazy" onerror="this.style.background=\'var(--bg-button)\';this.src=\'\'">' +
-                '<div class="album-card-title">' + escapeHtml(a.album) + '</div>' +
-                '<div style="font-size:11px;color:var(--fg-dim);">' + escapeHtml(a.artist) + ' · ' + (a.track_count || 0) + '</div></div>';
+            const card = document.createElement('div');
+            card.className = 'album-card';
+            card.addEventListener('click', () => openBrowserAlbum(String(a.dir || ''), String(a.album || '')));
+
+            const img = document.createElement('img');
+            img.className = 'music-album-cover';
+            img.loading = 'lazy';
+            img.src = browserCoverURL(a.artist, a.album);
+            img.addEventListener('error', () => {
+                img.style.background = 'var(--bg-button)';
+                img.removeAttribute('src');
+            });
+
+            const title = document.createElement('div');
+            title.className = 'album-card-title';
+            title.textContent = a.album || '';
+
+            const meta = document.createElement('div');
+            meta.style.fontSize = '11px';
+            meta.style.color = 'var(--fg-dim)';
+            meta.textContent = (a.artist || '') + ' · ' + (a.track_count || 0);
+
+            card.append(img, title, meta);
+            grid.appendChild(card);
         });
-        grid.innerHTML = html;
-    } catch (e) { grid.innerHTML = '<div class="error">Ошибка: ' + e.message + '</div>'; }
+    } catch (e) {
+        grid.replaceChildren();
+        const err = document.createElement('div');
+        err.className = 'error';
+        err.textContent = 'Ошибка: ' + e.message;
+        grid.appendChild(err);
+    }
 }
 let browserCurrentArtist = '';
 async function openBrowserAlbum(dir, album) {
@@ -2041,13 +2078,26 @@ async function openBrowserAlbum(dir, album) {
         const d = await r.json();
         const el = document.getElementById('browser-tracks');
         if (!el) return;
-        let html = '<div style="font-size:13px;font-weight:600;margin-bottom:6px;">' + escapeHtml(d.album || album) + '</div>';
+
+        el.replaceChildren();
+        const head = document.createElement('div');
+        head.style.cssText = 'font-size:13px;font-weight:600;margin-bottom:6px;';
+        head.textContent = d.album || album || '';
+        el.appendChild(head);
+
         (d.tracks || []).forEach(t => {
-            const f = String(t.file || '').replace(/'/g, "\\'");
-            const ti = String(t.title || '').replace(/'/g, "\\'");
-            html += '<div class="track-row" onclick="playBrowserTrack(\'' + f + '\',\'' + ti + '\')"><span class="track-title">' + escapeHtml(t.title || t.file) + '</span></div>';
+            const row = document.createElement('div');
+            row.className = 'track-row';
+            row.addEventListener('click', () => playBrowserTrack(String(t.file || ''), String(t.title || '')));
+
+            const span = document.createElement('span');
+            span.className = 'track-title';
+            span.textContent = t.title || t.file || '';
+
+            row.appendChild(span);
+            el.appendChild(row);
         });
-        el.innerHTML = html;
+
         el.scrollIntoView({behavior: 'smooth', block: 'nearest'});
     } catch (e) { notify('❌ ' + e.message, true); }
 }
@@ -2143,9 +2193,10 @@ async function chooseProfile(id, silent) {
         });
         if (r.ok) {
             const d = await r.json();
+            // Профиль — это UI-состояние. auth-service больше не выпускает
+            // токен на /select, поэтому jwt_token (admin) не подменяется.
             storeSet('profileId', String(d.profile_id));
-            if (d.token) { authToken = d.token; storeSet('jwt_token', d.token); }
-            const p = profilesCache.find(x => x.id === d.profile_id);
+            const p = d.profile || profilesCache.find(x => x.id === d.profile_id);
             if (p) storeSet('profileMaxRating', p.max_rating || 'R');
             const m = document.getElementById('profile-modal');
             if (m) m.classList.remove('show');

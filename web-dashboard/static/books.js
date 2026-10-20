@@ -14,7 +14,7 @@ async function searchBooks() {
         const d = await r.json();
 
         if (d.error) {
-            grid.innerHTML = '<div class="error">Ошибка: ' + d.error + '</div>';
+            grid.innerHTML = '<div class="error">Ошибка: ' + escapeHtml(d.error) + '</div>';
             return;
         }
 
@@ -73,8 +73,8 @@ function renderBooks() {
         html += '<div class="book-title" title="' + bt + '">' + bt + '</div>';
         html += '<div class="book-author">' + escapeHtml(b.author || 'Неизвестен') + '</div>';
         html += '<div class="book-meta">';
-        html += '<span>' + (b.year || '—') + '</span>';
-        html += '<span>' + (b.language || '—') + '</span>';
+        html += '<span>' + escapeHtml(b.year || '—') + '</span>';
+        html += '<span>' + escapeHtml(b.language || '—') + '</span>';
         html += '</div>';
         html += '<div class="book-formats">' + buttonsHTML + '</div>';
         html += '</div>';
@@ -122,15 +122,15 @@ async function loadDownloaded() {
         d.books.sort((a, b) => new Date(b.modtime) - new Date(a.modtime));
         d.books.forEach(b => {
             const date = new Date(b.modtime).toLocaleString('ru-RU');
-            const safeName = b.name.replace(/'/g, "\\'");
+            const safeName = escapeHtml(b.name);
             const isBook = /\.(epub|fb2)$/i.test(b.name);
             html += '<div class="history-item">';
-            html += '<span>📚 ' + escapeHtml(b.name) + '</span>';
-            html += '<span class="time">' + formatSize(b.size) + ' · ' + date + '</span>';
+            html += '<span>📚 ' + safeName + '</span>';
+            html += '<span class="time">' + formatSize(b.size) + ' · ' + escapeHtml(date) + '</span>';
             if (isBook) {
-                html += '<button onclick="openReader(\'' + safeName + '\')" style="padding:4px 10px;font-size:11px;margin-left:10px;background:var(--accent);color:var(--bg);">📖 Читать</button>';
+                html += '<button data-name="' + safeName + '" onclick="openReader(this.dataset.name)" style="padding:4px 10px;font-size:11px;margin-left:10px;background:var(--accent);color:var(--bg);">📖 Читать</button>';
             }
-            html += '<button onclick="openLocal(\'' + safeName + '\')" style="padding:4px 10px;font-size:11px;margin-left:6px;background:var(--success);color:var(--bg);">📂 Открыть</button>';
+            html += '<button data-name="' + safeName + '" onclick="openLocal(this.dataset.name)" style="padding:4px 10px;font-size:11px;margin-left:6px;background:var(--success);color:var(--bg);">📂 Открыть</button>';
             html += '</div>';
         });
         html += '</div>';
@@ -142,7 +142,10 @@ async function loadDownloaded() {
 
 async function openLocal(name) {
     try {
-        const r = await fetch(NAS_CONFIG.booksOpenerUrl + '/open?name=' + encodeURIComponent(name));
+        const r = await fetch(NAS_CONFIG.booksOpenerUrl + '/open?name=' + encodeURIComponent(name), {
+            method: 'POST',
+            headers: {'X-Opener': '1'}
+        });
         const d = await r.json();
         if (d.error) {
             notify('❌ Ошибка: ' + d.error, true);
@@ -156,7 +159,10 @@ async function openLocal(name) {
 
 async function openFolder() {
     try {
-        const r = await fetch(NAS_CONFIG.booksOpenerUrl + '/open-folder');
+        const r = await fetch(NAS_CONFIG.booksOpenerUrl + '/open-folder', {
+            method: 'POST',
+            headers: {'X-Opener': '1'}
+        });
         const d = await r.json();
         if (d.error) {
             notify('❌ Ошибка: ' + d.error, true);

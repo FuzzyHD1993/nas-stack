@@ -342,7 +342,17 @@ BIT_PERFECT_ENABLED=false
 				target := platform.GetEnv("SCHEDULER_URL", "http://scheduler-service:8084") + "/prowlarr/setup"
 				payload := fmt.Sprintf(`{"api_key":%q}`, req.ProwlarrKey)
 				hc := &http.Client{Timeout: 60 * time.Second}
-				resp, err := hc.Post(target, "application/json", strings.NewReader(payload))
+				httpReq, err := http.NewRequest(http.MethodPost, target, strings.NewReader(payload))
+				if err != nil {
+					log.Printf("⚠️ Prowlarr auto-setup: %v", err)
+					return
+				}
+				httpReq.Header.Set("Content-Type", "application/json")
+				// /prowlarr/setup закрыт ADMIN_TOKEN (раньше был анонимным SSRF).
+				if t := strings.TrimSpace(os.Getenv("ADMIN_TOKEN")); t != "" {
+					httpReq.Header.Set("X-Admin-Token", t)
+				}
+				resp, err := hc.Do(httpReq)
 				if err != nil {
 					log.Printf("⚠️ Prowlarr auto-setup: %v", err)
 					return

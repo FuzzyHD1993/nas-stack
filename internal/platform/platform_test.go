@@ -10,6 +10,14 @@ func TestGetEnv(t *testing.T) {
 	if got := GetEnv("__NAS_TEST_MISSING__", "def"); got != "def" {
 		t.Fatalf("GetEnv default = %q, want %q", got, "def")
 	}
+	t.Setenv("__NAS_TEST_WS__", "   ")
+	if got := GetEnv("__NAS_TEST_WS__", "def"); got != "def" {
+		t.Fatalf("GetEnv(whitespace) = %q, want %q", got, "def")
+	}
+	t.Setenv("__NAS_TEST_WS__", " value ")
+	if got := GetEnv("__NAS_TEST_WS__", "def"); got != " value " {
+		t.Fatalf("GetEnv(common) = %q, want %q", got, " value ")
+	}
 }
 
 func TestHealthJSON(t *testing.T) {

@@ -3,6 +3,11 @@ package main
 import "testing"
 
 func TestToHostPath(t *testing.T) {
+	t.Setenv("MEDIA_MOVIES_DIR", "/movies")
+	t.Setenv("MEDIA_TV_DIR", "/tv")
+	t.Setenv("MEDIA_MOVIES_HOST_DIR", "/mnt/nas/root/FuzzyHD/Movies")
+	t.Setenv("MEDIA_TV_HOST_DIR", "/mnt/nas/root/FuzzyHD/TV")
+
 	cases := []struct {
 		in, typ, want string
 	}{
@@ -10,8 +15,61 @@ func TestToHostPath(t *testing.T) {
 		{"/tv/Show/S01E01.mkv", "tv", "/mnt/nas/root/FuzzyHD/TV/Show/S01E01.mkv"},
 	}
 	for _, tc := range cases {
-		if got := toHostPath(tc.in, tc.typ); got != tc.want {
+		got, err := toHostPath(tc.in, tc.typ)
+		if err != nil {
+			t.Fatalf("toHostPath(%q,%q): %v", tc.in, tc.typ, err)
+		}
+		if got != tc.want {
 			t.Errorf("toHostPath(%q,%q) = %q, want %q", tc.in, tc.typ, got, tc.want)
+		}
+	}
+}
+
+func TestToHostPathRejectsEscapes(t *testing.T) {
+	t.Setenv("MEDIA_MOVIES_DIR", "/movies")
+	t.Setenv("MEDIA_TV_DIR", "/tv")
+	t.Setenv("MEDIA_MOVIES_HOST_DIR", "/mnt/nas/root/FuzzyHD/Movies")
+	t.Setenv("MEDIA_TV_HOST_DIR", "/mnt/nas/root/FuzzyHD/TV")
+
+	for _, tc := range []struct {
+		in, typ string
+	}{
+		{"/movies/../etc/passwd", "movie"},
+		{"/etc/passwd", "movie"},
+		{"/movies", "movie"},
+		{"/tv", "tv"},
+		{"/movies-evil/x.mkv", "movie"},
+		{"/tv/Show/S01E01.mkv", "movie"},
+		{"/movies/../TV/x.mkv", "movie"},
+		{"/movies/x.mkv", ""},
+		{"/movies/x.mkv", "photo"},
+		{"movies/x.mkv", "movie"},
+	} {
+		if got, err := toHostPath(tc.in, tc.typ); err == nil {
+			t.Errorf("toHostPath(%q,%q) = %q, want error", tc.in, tc.typ, got)
+		}
+	}
+}
+
+func TestPosterURLAllowed(t *testing.T) {
+	for _, raw := range []string{
+		"https://image.tmdb.org/t/p/w500/a.jpg",
+		"https://image.tmdb.org/t/p/original/a.jpg?x=1",
+	} {
+		if _, ok := posterURLAllowed(raw); !ok {
+			t.Errorf("posterURLAllowed(%q) = false, want true", raw)
+		}
+	}
+	for _, raw := range []string{
+		"",
+		"http://image.tmdb.org/t/p/w500/a.jpg",
+		"https://image.tmdb.org.evil/t/p/w500/a.jpg",
+		"https://user@image.tmdb.org/t/p/w500/a.jpg",
+		"https://image.tmdb.org/3/movie/1?api_key=x",
+		"https://evil.example/t/p/w500/a.jpg",
+	} {
+		if _, ok := posterURLAllowed(raw); ok {
+			t.Errorf("posterURLAllowed(%q) = true, want false", raw)
 		}
 	}
 }
@@ -46,13 +104,38 @@ func TestStripExtensionOnlyVideo(t *testing.T) {
 }
 
 func TestIsVideoAudioExt(t *testing.T) {
-	if !isVideoExt(".mkv") || !isVideoExt(".mp4") {
-		t.Error("video ext not detected")
+	for _, ext := range []string{".mkv", ".mp4", ".avi", ".m4v", ".mov", ".webm", ".wmv", ".MKV", ".WebM"} {
+		if !isVideoExt(ext) {
+			t.Errorf("isVideoExt(%q) = false, want true", ext)
+		}
+		if got := stripExtension("x" + ext); got != "x" {
+			t.Errorf("stripExtension(x%s) = %q, want x", ext, got)
+		}
 	}
-	if !isAudioExt(".flac") || !isAudioExt(".mp3") {
-		t.Error("audio ext not detected")
+	for _, ext := range []string{".flac", ".mp3", ".m4a", ".opus", ".FLAC"} {
+		if !isAudioExt(ext) {
+			t.Errorf("isAudioExt(%q) = false, want true", ext)
+		}
+		if isVideoExt(ext) {
+			t.Errorf("isVideoExt(%q) = true, audio must not be video", ext)
+		}
 	}
-	if isVideoExt(".flac") {
-		t.Error("flac must not be video")
+}
+
+func TestParseNameFallbackStripsExtension(t *testing.T) {
+	for _, tc := range []struct {
+		in, title string
+		year      int
+	}{
+		{"1917.mkv", "1917", 1917},
+		{"1080p.mkv", "1080p", 0},
+		{"01 Жуки.mkv", "Жуки", 0},
+		{"The Matrix", "The Matrix", 0},
+		{"", "", 0},
+	} {
+		gotTitle, gotYear := parseName(tc.in)
+		if gotTitle != tc.title || gotYear != tc.year {
+			t.Errorf("parseName(%q) = (%q, %d), want (%q, %d)", tc.in, gotTitle, gotYear, tc.title, tc.year)
+		}
 	}
 }

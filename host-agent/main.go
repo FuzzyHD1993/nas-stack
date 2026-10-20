@@ -1,29 +1,86 @@
 package main
 
 import (
+	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
+	"math"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/FuzzyHD1993/nas-stack/internal/platform"
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/middleware/adaptor"
+	"github.com/gofiber/fiber/v3/middleware/recover"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+// updateRunning — single-flight для /update/run: параллельные git pull/compose
+// ломают index.lock и рестартят контейнеры.
+var updateRunning atomic.Bool
+
+// runUpdateScript вынесен в переменную для инъекции в тестах:
+// тест не должен реально запускать update.sh на CI-хосте.
+var runUpdateScript = func(dir, script string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "bash", script)
+	cmd.Dir = dir
+	cmd.WaitDelay = 5 * time.Second
+	return cmd.CombinedOutput()
+}
+
+// execOutput — внешняя команда с дедлайном: зависший df/du/smartctl на
+// сетевой ФС не должен держать горутину fiber вечно.
+func execOutput(timeout time.Duration, name string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = 2 * time.Second
+	return cmd.Output()
+}
+
+// ifaceRe — Linux IFNAMSIZ=16, без ведущего '-', чтобы не было argument injection.
+var ifaceRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,14}$`)
+
+// validIface не даёт передать в argv `ip` флаги (-batch) и мусорные имена.
+func validIface(s string) bool {
+	return ifaceRe.MatchString(s)
+}
 
 // newApp собирает приложение агента. Вынесено из main(), потому что на каждый
 // адрес прослушивания нужен СВОЙ экземпляр: fiber не умеет обслуживать один
 // App двумя слушателями (app.Listener + app.Listen ломают startupProcess).
 func newApp() *fiber.App {
-	app := fiber.New()
+	app := fiber.New(fiber.Config{
+		AppName:      "NAS Host Agent",
+		BodyLimit:    1 << 20,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 5 * time.Minute,
+		IdleTimeout:  60 * time.Second,
+	})
+
+	app.Use(recover.New())
+	app.Use(func(c fiber.Ctx) error {
+		c.Set("X-Content-Type-Options", "nosniff")
+		c.Set("Cache-Control", "no-store")
+		return c.Next()
+	})
 
 	app.Get("/metrics", adaptor.HTTPHandler(promhttp.Handler()))
 
@@ -33,23 +90,24 @@ func newApp() *fiber.App {
 		return c.JSON(fiber.Map{"status": "ok", "service": "host-agent", "hostname": host, "kernel": kernel, "time": time.Now()})
 	})
 
-	app.Get("/sensors", func(c fiber.Ctx) error {
-		out, err := exec.Command("sensors", "-j").Output()
+	app.Get("/sensors", requireAdminToken, func(c fiber.Ctx) error {
+		out, err := execOutput(5*time.Second, "sensors", "-j")
 		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": "sensors: " + err.Error()})
+			log.Printf("sensors: %v", err)
+			return c.Status(500).JSON(fiber.Map{"error": "sensors unavailable"})
 		}
 		return c.JSON(parseSensors(out))
 	})
 
-	app.Get("/smart", func(c fiber.Ctx) error {
+	app.Get("/smart", requireAdminToken, func(c fiber.Ctx) error {
 		return c.JSON(getSmart())
 	})
 
-	app.Get("/disks", func(c fiber.Ctx) error {
+	app.Get("/disks", requireAdminToken, func(c fiber.Ctx) error {
 		return c.JSON(getDisks())
 	})
 
-	app.Get("/processes", func(c fiber.Ctx) error {
+	app.Get("/processes", requireAdminToken, func(c fiber.Ctx) error {
 		limit, _ := strconv.Atoi(c.Query("limit", "10"))
 		if limit <= 0 || limit > 100 {
 			limit = 10
@@ -57,26 +115,29 @@ func newApp() *fiber.App {
 		return c.JSON(getProcesses(limit))
 	})
 
-	app.Get("/network", func(c fiber.Ctx) error {
-		iface := c.Query("iface", "eno1")
+	app.Get("/network", requireAdminToken, func(c fiber.Ctx) error {
+		iface := strings.TrimSpace(c.Query("iface", "eno1"))
+		if !validIface(iface) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid iface"})
+		}
 		return c.JSON(getNetwork(iface))
 	})
 
-	app.Get("/uptime", func(c fiber.Ctx) error {
-		out, _ := exec.Command("uptime", "-p").Output()
+	app.Get("/uptime", requireAdminToken, func(c fiber.Ctx) error {
+		out, _ := execOutput(3*time.Second, "uptime", "-p")
 		return c.JSON(fiber.Map{"uptime": strings.TrimSpace(string(out))})
 	})
 
-	app.Get("/load", func(c fiber.Ctx) error {
+	app.Get("/load", requireAdminToken, func(c fiber.Ctx) error {
 		data, _ := os.ReadFile("/proc/loadavg")
 		fields := strings.Fields(string(data))
 		return c.JSON(fiber.Map{"raw": strings.TrimSpace(string(data)), "load1": atof(fields, 0), "load5": atof(fields, 1), "load15": atof(fields, 2)})
 	})
 
-	app.Get("/gpu", func(c fiber.Ctx) error {
-		out, err := exec.Command("nvidia-smi",
+	app.Get("/gpu", requireAdminToken, func(c fiber.Ctx) error {
+		out, err := execOutput(5*time.Second, "nvidia-smi",
 			"--query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total",
-			"--format=csv,noheader,nounits").Output()
+			"--format=csv,noheader,nounits")
 		if err != nil {
 			return c.JSON(fiber.Map{"error": "nvidia-smi not available"})
 		}
@@ -90,21 +151,50 @@ func newApp() *fiber.App {
 		})
 	})
 
-	app.Get("/cleanup/preview", func(c fiber.Ctx) error {
+	app.Get("/cleanup/preview", requireAdminToken, func(c fiber.Ctx) error {
 		return c.JSON(cleanupPreview())
 	})
 
 	app.Post("/cleanup/run", requireAdminToken, func(c fiber.Ctx) error {
 		dry := c.Query("dry", "true") != "false"
+
 		var body struct {
 			Targets      []string `json:"targets"`
+			All          bool     `json:"all"`
 			AllowKernels bool     `json:"allow_kernels"`
 		}
-		_ = c.Bind().JSON(&body)
+		// Пустое/битое тело больше НЕ означает «удалить всё».
+		if len(c.Body()) > 0 {
+			if err := c.Bind().JSON(&body); err != nil {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "bad json"})
+			}
+		}
+		if body.AllowKernels {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "allow_kernels is not supported"})
+		}
+		if body.All && len(body.Targets) > 0 {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "use either targets or all=true"})
+		}
+		if len(body.Targets) > len(cleanupTargets) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "too many targets"})
+		}
+		for _, t := range body.Targets {
+			if !cleanupTargets[t] {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "unknown target: " + t})
+			}
+		}
+		if !body.All && len(body.Targets) == 0 {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "targets required (or all=true)"})
+		}
 		if dry {
 			return c.JSON(fiber.Map{"dry": true, "preview": cleanupPreview()})
 		}
-		return c.JSON(runCleanup(body.Targets, body.AllowKernels))
+		if !cleanupMu.TryLock() {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "cleanup already running"})
+		}
+		defer cleanupMu.Unlock()
+
+		return c.JSON(runCleanup(body.Targets, body.All))
 	})
 
 	// Перемещение дубликатов в бэкап (медиа смонтировано ro — пишем через агент).
@@ -112,26 +202,59 @@ func newApp() *fiber.App {
 	repoDir := func() string {
 		return platform.GetEnv("REPO_DIR", "/home/konstantin/projects/nas-stack")
 	}
-	app.Get("/update/status", func(c fiber.Ctx) error {
+	app.Get("/update/status", requireAdminToken, func(c fiber.Ctx) error {
 		dir := repoDir()
-		_ = exec.Command("git", "-C", dir, "fetch", "--quiet", "github", "main").Run()
-		cur, _ := exec.Command("git", "-C", dir, "rev-parse", "--short", "HEAD").Output()
-		cnt, _ := exec.Command("git", "-C", dir, "rev-list", "HEAD..github/main", "--count").Output()
-		n, _ := strconv.Atoi(strings.TrimSpace(string(cnt)))
+
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+
+		fetch := exec.CommandContext(ctx, "git", "-C", dir, "fetch", "--quiet", "github", "main")
+		fetch.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+		if out, err := fetch.CombinedOutput(); err != nil {
+			log.Printf("update/status: git fetch: %v: %s", err, redactLog(out))
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "git fetch failed"})
+		}
+
+		cur, err := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "--short", "HEAD").Output()
+		if err != nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "git unavailable"})
+		}
+		cnt, err := exec.CommandContext(ctx, "git", "-C", dir, "rev-list", "HEAD..github/main", "--count").Output()
+		if err != nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "git unavailable"})
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(string(cnt)))
+		if err != nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "unexpected git output"})
+		}
 		return c.JSON(fiber.Map{
 			"current_commit":    strings.TrimSpace(string(cur)),
 			"updates_available": n,
 		})
 	})
 	app.Post("/update/run", requireAdminToken, func(c fiber.Ctx) error {
-		dir := repoDir()
+		dir := strings.TrimSpace(repoDir())
+		if !filepath.IsAbs(dir) || filepath.Clean(dir) == string(filepath.Separator) {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "invalid REPO_DIR"})
+		}
+
+		script := filepath.Join(dir, "scripts", "update.sh")
+		fi, err := os.Stat(script)
+		if err != nil || !fi.Mode().IsRegular() {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "update script not found"})
+		}
+
+		if !updateRunning.CompareAndSwap(false, true) {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "update already running"})
+		}
+
 		go func() {
-			cmd := exec.Command("bash", dir+"/scripts/update.sh")
-			cmd.Dir = dir
-			out, err := cmd.CombinedOutput()
-			log.Printf("🔄 update: err=%v\n%s", err, out)
+			defer updateRunning.Store(false)
+			out, err := runUpdateScript(dir, script)
+			log.Printf("🔄 update: err=%v\n%s", err, redactLog(out))
 		}()
-		return c.JSON(fiber.Map{"status": "started"})
+
+		return c.Status(fiber.StatusAccepted).JSON(fiber.Map{"status": "started"})
 	})
 
 	app.Post("/duplicates/resolve", requireAdminToken, func(c fiber.Ctx) error {
@@ -140,39 +263,156 @@ func newApp() *fiber.App {
 			Keep  string   `json:"keep"`
 		}
 		if err := c.Bind().JSON(&req); err != nil {
-			return c.Status(400).JSON(fiber.Map{"error": "bad json"})
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "bad json"})
 		}
-		const root = "/mnt/nas/root/FuzzyHD/"
-		libraryRoot := platform.GetEnv("LIBRARY_ROOT", root)
-		backupDir := platform.GetEnv("DUPLICATES_BACKUP_DIR", "/mnt/nas/Backups/duplicates")
-		if !strings.HasSuffix(libraryRoot, "/") {
-			libraryRoot += "/"
+		if len(req.Paths) == 0 || len(req.Paths) > 1000 {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid paths"})
 		}
-		if err := os.MkdirAll(backupDir, 0o755); err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+
+		libraryRoot := strings.TrimSpace(platform.GetEnv("LIBRARY_ROOT", "/mnt/nas/root/FuzzyHD"))
+		backupDir := strings.TrimSpace(platform.GetEnv("DUPLICATES_BACKUP_DIR", "/mnt/nas/Backups/duplicates"))
+
+		if libraryRoot == "" || filepath.Clean(libraryRoot) == string(filepath.Separator) {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "invalid LIBRARY_ROOT"})
 		}
+		if _, err := os.Stat(libraryRoot); err != nil {
+			log.Printf("duplicates: library root %s: %v", libraryRoot, err)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "library unavailable"})
+		}
+		rootAbs, err := filepath.Abs(filepath.Clean(libraryRoot))
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "invalid LIBRARY_ROOT"})
+		}
+
+		backupDir, err = filepath.Abs(filepath.Clean(backupDir))
+		if err != nil || backupDir == string(filepath.Separator) {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "invalid DUPLICATES_BACKUP_DIR"})
+		}
+		if rel, err := filepath.Rel(rootAbs, backupDir); err == nil &&
+			rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "backup dir must be outside LIBRARY_ROOT"})
+		}
+		if err := os.MkdirAll(backupDir, 0o750); err != nil {
+			log.Printf("duplicates: mkdir %s: %v", backupDir, err)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "backup dir unavailable"})
+		}
+
+		if strings.TrimSpace(req.Keep) == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "keep is required"})
+		}
+		keep, err := resolveLibraryPath(libraryRoot, req.Keep)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid keep path"})
+		}
+
 		moved, skipped := []string{}, []string{}
-		for _, p := range req.Paths {
-			if p == req.Keep || !strings.HasPrefix(p, libraryRoot) {
-				skipped = append(skipped, p)
+		for _, raw := range req.Paths {
+			src, err := resolveLibraryPath(libraryRoot, raw)
+			if err != nil || (keep != "" && src == keep) {
+				skipped = append(skipped, raw)
 				continue
 			}
-			target := filepathJoin(backupDir, filepathBase(p))
-			if _, err := os.Stat(target); err == nil {
-				ext := filepathExt(target)
-				target = strings.TrimSuffix(target, ext) + "-" + strconv.FormatInt(time.Now().Unix(), 10) + ext
-			}
-			if err := os.Rename(p, target); err != nil {
-				log.Printf("⚠️ rename %s → %s: %v", p, target, err)
-				skipped = append(skipped, p)
+
+			target, err := reserveBackupTarget(backupDir, filepath.Base(src))
+			if err != nil {
+				log.Printf("duplicates: reserve target for %s: %v", src, err)
+				skipped = append(skipped, raw)
 				continue
 			}
-			moved = append(moved, p)
+
+			if err := os.Rename(src, target); err != nil {
+				_ = os.Remove(target)
+				log.Printf("duplicates: rename %s -> %s: %v", src, target, err)
+				skipped = append(skipped, raw)
+				continue
+			}
+			moved = append(moved, raw)
 		}
+
 		return c.JSON(fiber.Map{"status": "ok", "moved": moved, "skipped": skipped})
 	})
 
 	return app
+}
+
+var errUnsafePath = errors.New("unsafe library path")
+
+// resolveLibraryPath возвращает реальный путь ТОЛЬКО если p — обычный файл
+// внутри libraryRoot (после Clean и EvalSymlinks).
+func resolveLibraryPath(libraryRoot, p string) (string, error) {
+	if strings.TrimSpace(p) == "" || !filepath.IsAbs(p) {
+		return "", errUnsafePath
+	}
+
+	root, err := filepath.Abs(filepath.Clean(libraryRoot))
+	if err != nil || root == string(filepath.Separator) {
+		return "", fmt.Errorf("%w: invalid library root", errUnsafePath)
+	}
+
+	src, err := filepath.Abs(filepath.Clean(p))
+	if err != nil {
+		return "", errUnsafePath
+	}
+
+	rel, err := filepath.Rel(root, src)
+	if err != nil || rel == "." || rel == ".." ||
+		strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", errUnsafePath
+	}
+
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("library root: %w", err)
+	}
+	realSrc, err := filepath.EvalSymlinks(src)
+	if err != nil {
+		return "", err
+	}
+
+	rel, err = filepath.Rel(realRoot, realSrc)
+	if err != nil || rel == "." || rel == ".." ||
+		strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", errUnsafePath
+	}
+
+	fi, err := os.Lstat(realSrc)
+	if err != nil {
+		return "", err
+	}
+	if !fi.Mode().IsRegular() {
+		return "", fmt.Errorf("%w: not a regular file", errUnsafePath)
+	}
+	return realSrc, nil
+}
+
+// reserveBackupTarget атомарно резервирует имя в backupDir, чтобы два
+// параллельных запроса не перетёрли один и тот же файл.
+func reserveBackupTarget(dir, base string) (string, error) {
+	if base == "" || base == "." || base == ".." ||
+		strings.ContainsAny(base, `/\`) {
+		return "", errUnsafePath
+	}
+
+	ext := filepath.Ext(base)
+	stem := strings.TrimSuffix(base, ext)
+
+	for i := 0; i < 100; i++ {
+		name := base
+		if i > 0 {
+			name = fmt.Sprintf("%s-%d-%d%s", stem, time.Now().UnixNano(), i, ext)
+		}
+		target := filepath.Join(dir, name)
+
+		f, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			_ = f.Close()
+			return target, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return "", err
+		}
+	}
+	return "", errors.New("cannot allocate backup name")
 }
 
 // main поднимает агент на адресах из HOST_AGENT_BIND.
@@ -189,9 +429,19 @@ func newApp() *fiber.App {
 // так что даже при 0.0.0.0 в bind опасные ручки недоступны без токена.
 func main() {
 	binds := agentBindAddrs()
+	hasToken := adminToken() != ""
 
-	if adminToken() == "" {
-		log.Println("⚠️ ADMIN_TOKEN не задан — /update/run, /cleanup/run и /duplicates/resolve будут отдавать 403")
+	if !hasToken {
+		log.Println("⚠️ ADMIN_TOKEN не задан — все ручки кроме /health и /metrics будут отдавать 403")
+	}
+
+	for _, addr := range binds {
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			log.Fatalf("host-agent: некорректный HOST_AGENT_BIND %q: %v", addr, err)
+		}
+		if !isLoopbackAddr(addr) && !hasToken {
+			log.Fatalf("host-agent: отказ запуска на %s без ADMIN_TOKEN", addr)
+		}
 	}
 
 	for _, extra := range binds[1:] {
@@ -210,7 +460,22 @@ func main() {
 	}
 
 	log.Printf("🖥️  host-agent на %s", binds[0])
-	log.Fatal(newApp().Listen(binds[0]))
+	if err := newApp().Listen(binds[0]); err != nil {
+		log.Fatalf("host-agent: %v", err)
+	}
+}
+
+// isLoopbackAddr — true для 127.0.0.0/8, ::1 и localhost.
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // stackEnvValue — platform.GetEnv с fallback'ом на REPO_DIR/.env.
@@ -222,22 +487,57 @@ func stackEnvValue(key, def string) string {
 		return v
 	}
 	repoDir := platform.GetEnv("REPO_DIR", "/home/konstantin/projects/nas-stack")
-	data, err := os.ReadFile(filepathJoin(repoDir, ".env"))
+	data, err := os.ReadFile(filepath.Join(repoDir, ".env"))
 	if err != nil {
 		return def
 	}
+	if v, ok := parseDotenv(data)[key]; ok {
+		return v
+	}
+	return def
+}
+
+// parseDotenv разбирает .env: export, кавычки, inline-комментарии, значения с '='.
+// При дубликатах ключа побеждает последнее значение — как при source в shell.
+func parseDotenv(data []byte) map[string]string {
+	out := make(map[string]string)
 	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
+		line = strings.TrimSpace(strings.TrimSuffix(line, "\r"))
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
+		line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+
 		k, v, ok := strings.Cut(line, "=")
-		if !ok || strings.TrimSpace(k) != key {
+		if !ok {
 			continue
 		}
-		return strings.Trim(strings.TrimSpace(v), `"'`)
+		k = strings.TrimSpace(k)
+		if k == "" {
+			continue
+		}
+		out[k] = dotenvValue(v)
 	}
-	return def
+	return out
+}
+
+func dotenvValue(raw string) string {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return ""
+	}
+	switch v[0] {
+	case '"', '\'':
+		if i := strings.LastIndexByte(v[1:], v[0]); i >= 0 {
+			return v[1 : i+1] // содержимое кавычек как есть, '#' разрешён
+		}
+		return strings.Trim(v, `"'`)
+	default:
+		if i := strings.Index(v, " #"); i >= 0 {
+			v = v[:i]
+		}
+		return strings.TrimSpace(v)
+	}
 }
 
 // adminToken — секрет админ-операций (тот же ADMIN_TOKEN, что на gateway
@@ -249,16 +549,32 @@ func adminToken() string {
 // agentBindAddrs — список адресов прослушивания из HOST_AGENT_BIND
 // (через запятую). По умолчанию только loopback.
 func agentBindAddrs() []string {
-	var out []string
 	raw := stackEnvValue("HOST_AGENT_BIND", "127.0.0.1:9998")
+
+	seen := make(map[string]struct{})
+	out := make([]string, 0, 2)
 	for _, a := range strings.Split(raw, ",") {
 		a = strings.TrimSpace(a)
-		if a != "" {
-			out = append(out, a)
+		if a == "" {
+			continue
 		}
+		host, port, err := net.SplitHostPort(a)
+		if err != nil || host == "" || port == "" {
+			log.Printf("⚠️ HOST_AGENT_BIND: пропущен некорректный адрес %q: %v", a, err)
+			continue
+		}
+		if _, err := strconv.Atoi(port); err != nil {
+			log.Printf("⚠️ HOST_AGENT_BIND: пропущен некорректный порт %q", a)
+			continue
+		}
+		if _, dup := seen[a]; dup {
+			continue
+		}
+		seen[a] = struct{}{}
+		out = append(out, a)
 	}
 	if len(out) == 0 {
-		out = []string{"127.0.0.1:9998"}
+		return []string{"127.0.0.1:9998"}
 	}
 	return out
 }
@@ -270,16 +586,25 @@ func adminTokenOK(c fiber.Ctx) bool {
 	if expected == "" {
 		return false
 	}
-	got := strings.TrimSpace(c.Get("X-Admin-Token"))
-	if got == "" {
-		if auth := c.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
-			got = strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+
+	candidates := []string{strings.TrimSpace(c.Get("X-Admin-Token"))}
+	if auth := strings.TrimSpace(c.Get("Authorization")); len(auth) >= 7 && strings.EqualFold(auth[:7], "Bearer ") {
+		candidates = append(candidates, strings.TrimSpace(auth[7:]))
+	}
+
+	// Хэш фиксированной длины: убирает утечку длины токена через
+	// ConstantTimeCompare (при разной длине он возвращается сразу).
+	want := sha256.Sum256([]byte(expected))
+	for _, got := range candidates {
+		if got == "" {
+			continue
+		}
+		h := sha256.Sum256([]byte(got))
+		if subtle.ConstantTimeCompare(h[:], want[:]) == 1 {
+			return true
 		}
 	}
-	if got == "" {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(got), []byte(expected)) == 1
+	return false
 }
 
 // requireAdminToken — миддлварь для ручек с побочными эффектами на хосте:
@@ -293,7 +618,7 @@ func requireAdminToken(c fiber.Ctx) error {
 }
 
 func kernelVersion() string {
-	out, _ := exec.Command("uname", "-r").Output()
+	out, _ := execOutput(3*time.Second, "uname", "-r")
 	return strings.TrimSpace(string(out))
 }
 
@@ -306,6 +631,11 @@ func atof(f []string, i int) float64 {
 }
 
 // ============================== SENSORS ==============================
+
+var (
+	tempRe = regexp.MustCompile(`(?i)temp|package|composite|core|tctl|tccd|sensor`)
+	coreRe = regexp.MustCompile(`(?i)\bcore\b|tccd`)
+)
 
 // parseSensors разбирает JSON от `sensors -j` и извлекает температуры.
 func parseSensors(data []byte) fiber.Map {
@@ -325,9 +655,6 @@ func parseSensors(data []byte) fiber.Map {
 	cores := []temp{}
 	nvme := []temp{}
 	other := []temp{}
-
-	tempRe := regexp.MustCompile(`(?i)temp|package|composite|core|tctl|tccd|sensor`)
-	coreRe := regexp.MustCompile(`(?i)\bcore\b|tccd`)
 
 	for chip, features := range root {
 		chipLow := strings.ToLower(chip)
@@ -401,7 +728,7 @@ func toFloat(v interface{}) (float64, bool) {
 // ============================== SMART ==============================
 
 func getSmart() []fiber.Map {
-	candidates := []string{"/dev/nvme0", "/dev/nvme0n1", "/dev/sda", "/dev/sdb", "/dev/sdc", "/dev/sdd"}
+	candidates := []string{"/dev/nvme0n1", "/dev/sda", "/dev/sdb", "/dev/sdc", "/dev/sdd"}
 	result := []fiber.Map{}
 	for _, dev := range candidates {
 		if _, err := os.Stat(dev); err != nil {
@@ -414,9 +741,9 @@ func getSmart() []fiber.Map {
 
 func smartOne(dev string) fiber.Map {
 	// smartctl требует root — пробуем через passwordless sudo.
-	out, err := exec.Command("sudo", "-n", "smartctl", "-a", "-j", dev).Output()
+	out, err := execOutput(20*time.Second, "sudo", "-n", "smartctl", "-a", "-j", dev)
 	if err != nil && len(out) == 0 {
-		out, err = exec.Command("smartctl", "-a", "-j", dev).Output()
+		out, err = execOutput(15*time.Second, "smartctl", "-a", "-j", dev)
 	}
 	if len(out) == 0 {
 		msg := "smartctl failed"
@@ -458,7 +785,7 @@ func smartOne(dev string) fiber.Map {
 	if t, ok := d["temperature"].(map[string]interface{}); ok {
 		temp = intAt(t, "current")
 	}
-	powerOn := intAt(d, "power_on_time")
+	powerOn := 0
 	if poh, ok := d["power_on_time"].(map[string]interface{}); ok {
 		powerOn = intAt(poh, "hours")
 	}
@@ -510,6 +837,19 @@ func intAt(m map[string]interface{}, key string) int {
 	return 0
 }
 
+// int64At — счётчики сети/байты не должны переполнять int на 32-битных платформах.
+func int64At(m map[string]interface{}, key string) int64 {
+	if m == nil {
+		return 0
+	}
+	if v, ok := m[key]; ok {
+		if f, ok := toFloat(v); ok {
+			return int64(f)
+		}
+	}
+	return 0
+}
+
 // ============================== DISKS ==============================
 
 var realFS = map[string]bool{
@@ -518,7 +858,7 @@ var realFS = map[string]bool{
 }
 
 func getDisks() []fiber.Map {
-	out, _ := exec.Command("df", "-h", "--output=source,fstype,size,used,avail,pcent,target").Output()
+	out, _ := execOutput(10*time.Second, "df", "-h", "--output=source,fstype,size,used,avail,pcent,target")
 	type disk struct{ source, fstype, total, used, avail, percent, mount string }
 	seen := map[string]int{}
 	list := []disk{}
@@ -551,7 +891,7 @@ func getDisks() []fiber.Map {
 // ============================== PROCESSES ==============================
 
 func getProcesses(limit int) []fiber.Map {
-	out, _ := exec.Command("ps", "aux", "--sort=-%cpu").Output()
+	out, _ := execOutput(5*time.Second, "ps", "aux", "--sort=-%cpu")
 	result := []fiber.Map{}
 	for i, line := range strings.Split(string(out), "\n") {
 		if i == 0 {
@@ -576,7 +916,7 @@ func getProcesses(limit int) []fiber.Map {
 // ============================== NETWORK ==============================
 
 func getNetwork(iface string) fiber.Map {
-	out, err := exec.Command("ip", "-s", "-j", "link", "show", iface).Output()
+	out, err := execOutput(5*time.Second, "ip", "-s", "-j", "link", "show", iface)
 	if err != nil {
 		return fiber.Map{"error": err.Error()}
 	}
@@ -593,14 +933,14 @@ func getNetwork(iface string) fiber.Map {
 	tx, _ := stats["tx"].(map[string]interface{})
 	return fiber.Map{
 		"iface":      iface,
-		"rx_bytes":   intAt(rx, "bytes"),
-		"tx_bytes":   intAt(tx, "bytes"),
-		"rx_errors":  intAt(rx, "errors"),
-		"tx_errors":  intAt(tx, "errors"),
-		"rx_dropped": intAt(rx, "dropped"),
-		"tx_dropped": intAt(tx, "dropped"),
-		"rx_packets": intAt(rx, "packets"),
-		"tx_packets": intAt(tx, "packets"),
+		"rx_bytes":   int64At(rx, "bytes"),
+		"tx_bytes":   int64At(tx, "bytes"),
+		"rx_errors":  int64At(rx, "errors"),
+		"tx_errors":  int64At(tx, "errors"),
+		"rx_dropped": int64At(rx, "dropped"),
+		"tx_dropped": int64At(tx, "dropped"),
+		"rx_packets": int64At(rx, "packets"),
+		"tx_packets": int64At(tx, "packets"),
 	}
 }
 
@@ -629,25 +969,50 @@ func cleanupPreview() []fiber.Map {
 	return items
 }
 
-func runCleanup(targets []string, allowKernels bool) fiber.Map {
-	want := map[string]bool{}
-	for _, t := range targets {
-		want[t] = true
+var cleanupTargets = map[string]bool{
+	"podman_images": true,
+	"journald":      true,
+	"cache":         true,
+	"trash":         true,
+	"pacman_cache":  true,
+}
+
+// cleanupMu не даёт двум очисткам одновременно считать before/after.
+var cleanupMu sync.Mutex
+
+func runCleanup(targets []string, all bool) fiber.Map {
+	want := make(map[string]bool, len(targets))
+	if all {
+		for t := range cleanupTargets {
+			want[t] = true
+		}
+	} else {
+		for _, t := range targets {
+			if cleanupTargets[t] {
+				want[t] = true
+			}
+		}
 	}
-	doAll := len(targets) == 0
+
 	results := []fiber.Map{}
 	freed := int64(0)
+	home, homeErr := os.UserHomeDir()
 
-	run := func(name, cmd string) {
-		if !doAll && !want[name] {
+	apply := func(name string, fn func(context.Context) error) {
+		if !want[name] {
 			return
 		}
 		before := cleanupSizeFor(name)
-		out, err := exec.Command("sh", "-c", cmd).CombinedOutput()
-		if err != nil {
-			results = append(results, fiber.Map{"target": name, "ok": false, "error": err.Error(), "output": strings.TrimSpace(string(out))})
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+
+		if err := fn(ctx); err != nil {
+			log.Printf("cleanup %s: %v", name, err)
+			results = append(results, fiber.Map{"target": name, "ok": false, "error": "cleanup failed"})
 			return
 		}
+
 		after := cleanupSizeFor(name)
 		f := before - after
 		if f < 0 {
@@ -657,21 +1022,59 @@ func runCleanup(targets []string, allowKernels bool) fiber.Map {
 		results = append(results, fiber.Map{"target": name, "ok": true, "freed_bytes": f})
 	}
 
-	run("podman_images", "podman system prune -a --volumes -f")
-	run("journald", "journalctl --vacuum-size=500M")
-	run("cache", "find ~/.cache -type f -atime +30 -delete 2>/dev/null || true")
-	run("trash", "rm -rf ~/.local/share/Trash/* 2>/dev/null || true")
-	run("pacman_cache", "paccache -rk3")
-
-	if allowKernels && (doAll || want["old_kernels"]) {
-		results = append(results, fiber.Map{"target": "old_kernels", "ok": false, "error": "ручное удаление ядер не поддерживается"})
-	}
+	// Никакого sh -c: только argv, без ~ и без интерполяции.
+	apply("podman_images", func(ctx context.Context) error {
+		return exec.CommandContext(ctx, "podman", "system", "prune", "-a", "--volumes", "-f").Run()
+	})
+	apply("journald", func(ctx context.Context) error {
+		return exec.CommandContext(ctx, "journalctl", "--vacuum-size=500M").Run()
+	})
+	apply("cache", func(ctx context.Context) error {
+		if homeErr != nil {
+			return homeErr
+		}
+		dir := filepath.Join(home, ".cache")
+		if _, err := os.Stat(dir); err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		return exec.CommandContext(ctx, "find", dir, "-type", "f", "-atime", "+30", "-delete").Run()
+	})
+	apply("trash", func(ctx context.Context) error {
+		if homeErr != nil {
+			return homeErr
+		}
+		return emptyDir(filepath.Join(home, ".local", "share", "Trash"))
+	})
+	apply("pacman_cache", func(ctx context.Context) error {
+		return exec.CommandContext(ctx, "paccache", "-rk3").Run()
+	})
 
 	return fiber.Map{"dry": false, "freed_bytes": freed, "results": results}
 }
 
+// emptyDir удаляет содержимое каталога, но не сам каталог (точку монтирования).
+func emptyDir(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var errs []error
+	for _, e := range entries {
+		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
 func podmanReclaimable() int64 {
-	out, err := exec.Command("podman", "system", "df", "--format", "json").Output()
+	out, err := execOutput(20*time.Second, "podman", "system", "df", "--format", "json")
 	if err != nil || len(out) == 0 {
 		return 0
 	}
@@ -707,22 +1110,23 @@ func cleanupSizeFor(name string) int64 {
 
 // dirSizeCmd — размер из команды вида "journalctl --disk-usage" (парсим "T archived").
 func dirSizeCmd(name string, args ...string) int64 {
-	out, err := exec.Command(name, args...).Output()
+	out, err := execOutput(10*time.Second, name, args...)
 	if err != nil {
 		return 0
 	}
 	s := strings.TrimSpace(string(out))
 	// пример: "Archived and active journals take up 123.4M in the file system."
-	re := regexp.MustCompile(`([0-9.,]+)\s*([KMGT]?B?)`)
-	m := re.FindStringSubmatch(s)
+	m := sizeRe.FindStringSubmatch(s)
 	if m == nil {
 		return 0
 	}
 	return parseHumanSize(m[1] + m[2])
 }
 
+var sizeRe = regexp.MustCompile(`([0-9]+(?:[.,][0-9]+)?)\s*([KMGTP]?i?B?)`)
+
 func duSize(path string) int64 {
-	out, _ := exec.Command("du", "-sb", path).Output()
+	out, _ := execOutput(30*time.Second, "du", "-sb", path)
 	f := strings.Fields(string(out))
 	if len(f) < 1 {
 		return 0
@@ -733,69 +1137,78 @@ func duSize(path string) int64 {
 
 func oldKernels() int {
 	cur := kernelVersion()
-	out, err := exec.Command("ls", "/usr/lib/modules").Output()
+	entries, err := os.ReadDir("/usr/lib/modules")
 	if err != nil {
 		return 0
 	}
 	n := 0
-	for _, m := range strings.Fields(string(out)) {
-		if m != cur {
+	for _, e := range entries {
+		if e.Name() != cur {
 			n++
 		}
 	}
 	return n
 }
 
-// parseHumanSize переводит "1.5G"/"300M"/"12K" в байты.
+// parseHumanSize переводит "1.5G"/"300M"/"1.2GB"/"1 GiB" в байты.
+// Мусор, NaN/Inf и отрицательные значения → 0; переполнение клампится в MaxInt64.
 func parseHumanSize(s string) int64 {
 	s = strings.TrimSpace(strings.ReplaceAll(s, ",", "."))
 	if s == "" {
 		return 0
 	}
-	mult := int64(1)
-	switch s[len(s)-1] {
-	case 'K', 'k':
-		mult = 1024
-		s = s[:len(s)-1]
-	case 'M', 'm':
-		mult = 1024 * 1024
-		s = s[:len(s)-1]
-	case 'G', 'g':
-		mult = 1024 * 1024 * 1024
-		s = s[:len(s)-1]
-	case 'T', 't':
-		mult = 1024 * 1024 * 1024 * 1024
-		s = s[:len(s)-1]
-	case 'B', 'b':
-		s = s[:len(s)-1]
+	if last := s[len(s)-1]; last == 'B' || last == 'b' {
+		s = strings.TrimSpace(s[:len(s)-1])
 	}
-	f, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
-	if err != nil {
+	// "1GiB" -> "1G"
+	if s != "" {
+		if last := s[len(s)-1]; last == 'i' || last == 'I' {
+			s = strings.TrimSpace(s[:len(s)-1])
+		}
+	}
+
+	mult := float64(1)
+	if s != "" {
+		switch s[len(s)-1] {
+		case 'K', 'k':
+			mult = 1 << 10
+		case 'M', 'm':
+			mult = 1 << 20
+		case 'G', 'g':
+			mult = 1 << 30
+		case 'T', 't':
+			mult = 1 << 40
+		case 'P', 'p':
+			mult = 1 << 50
+		}
+		if mult != 1 {
+			s = strings.TrimSpace(s[:len(s)-1])
+		}
+	}
+
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f < 0 {
 		return 0
 	}
-	return int64(f * float64(mult))
+	// float→int64 вне диапазона даёт MinInt64 на amd64 — клампим заранее.
+	if f >= float64(math.MaxInt64)/mult {
+		return math.MaxInt64
+	}
+	return int64(f * mult)
 }
 
-func filepathJoin(a, b string) string {
-	if strings.HasSuffix(a, "/") {
-		return a + b
-	}
-	return a + "/" + b
-}
+func filepathJoin(a, b string) string { return filepath.Join(a, b) }
+func filepathBase(p string) string    { return filepath.Base(p) }
+func filepathExt(p string) string     { return filepath.Ext(p) }
 
-func filepathBase(p string) string {
-	i := strings.LastIndexByte(p, '/')
-	if i < 0 {
-		return p
-	}
-	return p[i+1:]
-}
+var secretLineRe = regexp.MustCompile(`(?i)((?:token|password|secret|key)\s*=\s*)[^\s]+`)
 
-func filepathExt(p string) string {
-	b := filepathBase(p)
-	i := strings.LastIndexByte(b, '.')
-	if i <= 0 {
-		return ""
+// redactLog убирает секреты из вывода git/compose и ограничивает размер записи в journald.
+func redactLog(b []byte) string {
+	s := secretLineRe.ReplaceAllString(string(b), `${1}<redacted>`)
+	const max = 4096
+	if len(s) > max {
+		return s[:max] + "…"
 	}
-	return b[i:]
+	return s
 }
