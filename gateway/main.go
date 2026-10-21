@@ -547,6 +547,11 @@ func sanitizeRedirect(c fiber.Ctx, loc string) string {
 	if err != nil {
 		return ""
 	}
+	// magnet — не web-origin: open redirect на чужой сайт через него
+	// невозможен. Нужен для прокси скачивания Prowlarr (302 → magnet).
+	if strings.EqualFold(u.Scheme, "magnet") {
+		return loc
+	}
 	if u.Scheme != "" || u.Host != "" {
 		if (u.Scheme != "http" && u.Scheme != "https") ||
 			!strings.EqualFold(u.Host, c.Host()) {
@@ -983,8 +988,11 @@ func proxyHandler(baseURL, name string) fiber.Handler {
 		targetURL.RawQuery = string(c.Request().URI().QueryString())
 
 		timeout := 30 * time.Second
-		if name == "stats" {
+		switch name {
+		case "stats":
 			timeout = 60 * time.Second // /stats/nas: du -sh по CIFS может быть >30s
+		case "search":
+			timeout = 60 * time.Second // поиск Prowlarr и скачивание .torrent — до 60s
 		}
 
 		cfg := client.Config{

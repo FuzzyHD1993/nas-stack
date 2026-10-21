@@ -130,7 +130,7 @@ func TestSanitizeResults(t *testing.T) {
 		},
 		{
 			"title":       "URL only",
-			"downloadUrl": "https://tracker.example/dl/2",
+			"downloadUrl": "http://host.containers.internal:9696/2/download?apikey=super-secret&link=abc",
 			"seeders":     float64(10),
 		},
 	}
@@ -145,6 +145,21 @@ func TestSanitizeResults(t *testing.T) {
 	}
 	if out[1]["downloadUrl"] != "" {
 		t.Fatalf("javascript: URL не отфильтрован: %v", out[1]["downloadUrl"])
+	}
+	got := asString(out[0]["downloadUrl"])
+	if strings.Contains(got, "super-secret") || strings.Contains(strings.ToLower(got), "apikey") {
+		t.Fatalf("apikey утёк в downloadUrl: %q", got)
+	}
+	if !strings.HasPrefix(got, downloadBaseURL+"/search/download?url=") {
+		t.Fatalf("downloadUrl не через прокси: %q", got)
+	}
+	pu, err := url.Parse(got)
+	if err != nil {
+		t.Fatalf("downloadUrl не парсится: %v", err)
+	}
+	inner := pu.Query().Get("url")
+	if !strings.HasPrefix(inner, "/2/download?") || strings.Contains(strings.ToLower(inner), "apikey") {
+		t.Fatalf("внутренний url неверен: %q", inner)
 	}
 	if !strings.HasPrefix(out[1]["title"].(string), "Good") {
 		t.Fatalf("unexpected title: %q", out[1]["title"])

@@ -302,6 +302,7 @@ services:
     environment:
       - PROWLARR_URL=http://host.containers.internal:9696
       - PROWLARR_API_KEY=${PROWLARR_API_KEY}
+      - DOWNLOAD_BASE_URL=${DOWNLOAD_BASE_URL:-http://host.containers.internal:8080}
       - REDIS_ADDR=redis:6379
     depends_on:
       - prowlarr

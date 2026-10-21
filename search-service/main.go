@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -39,6 +40,9 @@ const (
 	maxBodyBytes = 16 << 20
 	maxURLLen    = 4096
 
+	// Файл .torrent небольшой; больше этого не отдаём и не буферизуем.
+	maxDownloadBytes = 16 << 20
+
 	prowlarrTimeout    = 45 * time.Second
 	cacheTTL           = time.Hour
 	cacheTTLJitterSecs = 300
@@ -49,6 +53,14 @@ var (
 	prowlarrHost = hostOf(prowlarrURL)
 	apiKey       = strings.TrimSpace(platform.GetEnv("PROWLARR_API_KEY", ""))
 	rdb          *redis.Client
+
+	// downloadBaseURL — внешний адрес прокси скачивания (шлюз). Клиент
+	// получает ссылку без apikey; ключ добавляет сам сервис.
+	downloadBaseURL = strings.TrimRight(platform.GetEnv("DOWNLOAD_BASE_URL", "http://host.containers.internal:8080"), "/")
+
+	// Только путь скачивания индексатора Prowlarr: произвольные GET к API
+	// через прокси невозможны.
+	downloadPathRe = regexp.MustCompile(`^/(?:api/v1/indexer/)?[0-9]{1,12}/download$`)
 
 	errUpstream = errors.New("prowlarr unavailable")
 
@@ -143,6 +155,10 @@ func registerRoutes(app *fiber.App) {
 	app.Get("/metrics", adaptor.HTTPHandler(metricsHandler()))
 	app.Get("/health", func(c fiber.Ctx) error { return c.JSON(platform.HealthJSON("search", nil)) })
 	app.Get("/search", searchHandler)
+	// /download — путь за gateway (/search/download → /download); второй
+	// маршрут — если DOWNLOAD_BASE_URL указывает прямо на сервис.
+	app.Get("/download", downloadHandler)
+	app.Get("/search/download", downloadHandler)
 	app.Get("/indexers", indexersHandler)
 }
 
@@ -405,7 +421,7 @@ func sanitizeResults(raw []map[string]any) []fiber.Map {
 		}
 
 		magnet := safeMagnet(asString(r["magnetUrl"]))
-		downloadURL := safeResultURL(asString(r["downloadUrl"]))
+		downloadURL := proxyDownloadURL(safeResultURL(asString(r["downloadUrl"])))
 		if magnet == "" && downloadURL == "" {
 			continue
 		}
@@ -449,6 +465,138 @@ func sanitizeResults(raw []map[string]any) []fiber.Map {
 	return results
 }
 
+// proxyDownloadURL превращает ссылку Prowlarr в ссылку нашего прокси.
+// Хост Prowlarr и apikey клиенту не показываются: ключ добавляет
+// downloadHandler на сервере. Разрешены только пути скачивания.
+func proxyDownloadURL(raw string) string {
+	if raw == "" || downloadBaseURL == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || !downloadPathRe.MatchString(u.EscapedPath()) {
+		return ""
+	}
+	q := u.Query()
+	q.Del("apikey")
+	q.Del("api_key")
+	q.Del("X-Api-Key")
+	if q.Get("link") == "" {
+		return ""
+	}
+	inner := u.EscapedPath()
+	if enc := q.Encode(); enc != "" {
+		inner += "?" + enc
+	}
+	return downloadBaseURL + "/search/download?url=" + url.QueryEscape(inner)
+}
+
+// downloadTarget проверяет путь и собирает URL Prowlarr. Хост из запроса
+// клиента игнорируется — всегда prowlarrURL, поэтому подменить хост (SSRF)
+// нельзя. Ключ добавляется только здесь и клиенту не возвращается.
+func downloadTarget(raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || len(raw) > maxURLLen || strings.Contains(raw, "://") {
+		return "", false
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host != "" || u.User != nil || !downloadPathRe.MatchString(u.EscapedPath()) {
+		return "", false
+	}
+	q := u.Query()
+	q.Del("apikey")
+	q.Del("api_key")
+	q.Del("X-Api-Key")
+	if q.Get("link") == "" {
+		return "", false
+	}
+	q.Set("apikey", apiKey)
+	return prowlarrURL + u.EscapedPath() + "?" + q.Encode(), true
+}
+
+func validProxyDownloadURL(raw string) bool {
+	if !strings.HasPrefix(raw, downloadBaseURL+"/search/download?") {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	_, ok := downloadTarget(u.Query().Get("url"))
+	return ok
+}
+
+func downloadHandler(c fiber.Ctx) error {
+	target, ok := downloadTarget(c.Query("url"))
+	if !ok {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid download url"})
+	}
+
+	ctx, cancel := context.WithTimeout(c.Context(), 60*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid download url"})
+	}
+	req.Header.Set("X-Api-Key", apiKey)
+	req.Header.Set("Accept", "application/x-bittorrent, application/octet-stream, */*")
+
+	resp, err := prowlarrHTTP.Do(req)
+	if err != nil {
+		// В ошибке Go может быть полный URL с apikey — не логируем его.
+		msg := err.Error()
+		if apiKey != "" {
+			msg = strings.ReplaceAll(msg, apiKey, "***")
+		}
+		log.Printf("download: %s", msg)
+		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "upstream unavailable"})
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// Prowlarr умеет отвечать 302 на magnet/внешний URL. Пробрасываем
+	// редирект без ключа (prowlarrHTTP редиректы не выполняет).
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		loc := strings.TrimSpace(resp.Header.Get("Location"))
+		if !safeRedirectLocation(loc) {
+			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "upstream unavailable"})
+		}
+		return c.Redirect().Status(fiber.StatusFound).To(loc)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "upstream unavailable"})
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxDownloadBytes+1))
+	if err != nil {
+		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "upstream unavailable"})
+	}
+	if len(body) > maxDownloadBytes {
+		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "download too large"})
+	}
+
+	c.Set("Content-Type", "application/x-bittorrent")
+	c.Set("Content-Disposition", `attachment; filename="result.torrent"`)
+	c.Set("X-Content-Type-Options", "nosniff")
+	c.Set("Cache-Control", "no-store")
+	return c.Send(body)
+}
+
+func safeRedirectLocation(raw string) bool {
+	if raw == "" {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	switch u.Scheme {
+	case "magnet", "http", "https":
+		return true
+	default:
+		return false
+	}
+}
+
 func decodeCached(data []byte) ([]fiber.Map, bool) {
 	var results []fiber.Map
 	if err := json.Unmarshal(data, &results); err != nil {
@@ -464,7 +612,7 @@ func decodeCached(data []byte) ([]fiber.Map, bool) {
 		if m := asString(r["magnet"]); m != "" && safeMagnet(m) == "" {
 			return nil, false
 		}
-		if u := asString(r["downloadUrl"]); u != "" && safeResultURL(u) == "" {
+		if u := asString(r["downloadUrl"]); u != "" && !validProxyDownloadURL(u) {
 			return nil, false
 		}
 	}
@@ -475,7 +623,7 @@ func makeCacheKey(query, categories, indexerIDs string, limit, offset int) strin
 	h := sha256.New()
 	// length-prefixed части: коллизий "a:b"/"b" нет.
 	for _, p := range []string{
-		"v2",
+		"v3",
 		strings.ToLower(strings.TrimSpace(query)),
 		categories,
 		indexerIDs,
@@ -484,7 +632,7 @@ func makeCacheKey(query, categories, indexerIDs string, limit, offset int) strin
 	} {
 		fmt.Fprintf(h, "%d:%s|", len(p), p)
 	}
-	return "search:torrents:v2:" + hex.EncodeToString(h.Sum(nil))
+	return "search:torrents:v3:" + hex.EncodeToString(h.Sum(nil))
 }
 
 func parseBounded(s string, def, min, max int) (int, error) {
