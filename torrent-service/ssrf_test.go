@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 )
 
@@ -46,6 +48,52 @@ func TestResolveMagnetRejectsPrivateTarget(t *testing.T) {
 	defer srv.Close()
 	if m := resolveMagnet(context.Background(), srv.URL); m != "" {
 		t.Fatalf("resolveMagnet returned %q for loopback url", m)
+	}
+}
+
+// TestResolveMagnetTrusted: URL из allowlist (DOWNLOAD_BASE_URL + /search/download)
+// разрешён без SSRF-блока — даже если резолвится в loopback (как httptest-сервер).
+func TestResolveMagnetTrusted(t *testing.T) {
+	want := "magnet:?xt=urn:btih:" + strings.Repeat("0a", 20)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", want)
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer srv.Close()
+	t.Setenv("DOWNLOAD_BASE_URL", srv.URL)
+	if m := resolveMagnet(context.Background(), srv.URL+"/search/download"); m != want {
+		t.Fatalf("resolveMagnet = %q, want %q", m, want)
+	}
+}
+
+// TestIsTrustedDownloadURL: путь allowlist'а строгий — только точное совпадение
+// host:port и /search/download.
+func TestIsTrustedDownloadURL(t *testing.T) {
+	t.Setenv("DOWNLOAD_BASE_URL", "http://host.containers.internal:8080")
+	for _, ok := range []string{"http://host.containers.internal:8080/search/download?url=x"} {
+		u, err := url.Parse(ok)
+		if err != nil {
+			t.Fatalf("parse %q: %v", ok, err)
+		}
+		if !isTrustedDownloadURL(u) {
+			t.Errorf("isTrustedDownloadURL(%q) = false, want true", ok)
+		}
+	}
+	for _, no := range []string{
+		"http://host.containers.internal:8080/search/other?url=x",
+		"http://host.containers.internal:8080/other/download?url=x",
+		"http://evil.host:8080/search/download?url=x",
+		"https://host.containers.internal:8080/search/download?url=x",
+		"http://host.containers.internal:8081/search/download?url=x",
+		"http://host.containers.internal:8080/search/download/evil",
+	} {
+		u, err := url.Parse(no)
+		if err != nil {
+			t.Fatalf("parse %q: %v", no, err)
+		}
+		if isTrustedDownloadURL(u) {
+			t.Errorf("isTrustedDownloadURL(%q) = true, want false", no)
+		}
 	}
 }
 

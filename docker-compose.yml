@@ -144,6 +144,7 @@ services:
       - RUTRACKER_COOKIE=${RUTRACKER_COOKIE}
       - FLARESOLVERR_URL=http://flaresolverr:8191
       - FLARESOLVERR_TIMEOUT=${FLARESOLVERR_TIMEOUT:-120000}
+      - DOWNLOAD_BASE_URL=http://host.containers.internal:8080
     depends_on:
       redis:
         condition: service_healthy

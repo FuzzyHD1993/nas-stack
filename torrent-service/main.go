@@ -651,10 +651,16 @@ func addMagnetToNAS(magnet, dest string) error {
 	return nil
 }
 
-// addTorrentURLToNAS добавляет торрент по ссылке:
-//   - 1337x отдаёт magnet через 301-редирект — достаём magnet и добавляем через uri
-//   - иначе .torrent-файл — переписываем host.containers.internal на LAN-IP хоста
-//     и отдаём NAS на скачивание (multipart-upload .torrent на DSM 7.2 возвращает 101)
+// addTorrentURLToNAS добавляет торрент по ссылке, гарантируя, что в DSM
+// отправляется ТОЛЬКО magnet:
+//   - retries: 1337x и gateway /search/download отдают magnet через 3xx с
+//     Location: magnet:... — достаём его и добавляем через uri;
+//   - иначе: скачиваем .torrent (для trusted download-прокси — без SSRF-блока)
+//     и извлекаем magnet из его bencode (sha1 info-спана → btih);
+//   - если и это не вышло — возвращаем ошибку (задача не создаётся).
+//
+// Старый путь «отдать NAS HTTP-URL и надеяться» убран: DSM не следует редиректу
+// на magnet и создаёт http-задачу, навсегда висящую в waiting.
 func addTorrentURLToNAS(rctx context.Context, torrentURL, dest string) error {
 	u, err := validateTorrentURL(torrentURL)
 	if err != nil {
@@ -663,7 +669,15 @@ func addTorrentURLToNAS(rctx context.Context, torrentURL, dest string) error {
 	if magnet := resolveMagnet(rctx, u.String()); magnet != "" {
 		return addMagnetToNAS(magnet, dest)
 	}
-	return addMagnetToNAS(rewriteHost(u), dest)
+	data, err := fetchTorrent(rctx, u.String())
+	if err != nil {
+		return fmt.Errorf("torrent url %s: %w", u.String(), err)
+	}
+	magnet, err := magnetFromTorrent(data)
+	if err != nil {
+		return fmt.Errorf("torrent url %s: %w", u.String(), err)
+	}
+	return addMagnetToNAS(magnet, dest)
 }
 
 // magnetName извлекает читаемое имя (последний dn=) из magnet-ссылки, иначе btih-хеш
