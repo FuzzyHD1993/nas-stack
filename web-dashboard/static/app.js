@@ -32,6 +32,19 @@ function storeGet(k) { try { return localStorage.getItem(k); } catch (e) { try {
 function storeSet(k, v) { try { localStorage.setItem(k, v); } catch (e) { try { sessionStorage.setItem(k, v); } catch (e2) {} } }
 function storeDel(k) { try { localStorage.removeItem(k); } catch (e) { try { sessionStorage.removeItem(k); } catch (e2) {} } }
 
+// ==================== Опрос фоновых вкладок ====================
+// setPolling(fn, ms): общий helper вместо голого setInterval.
+// - не выполняет запрос, пока вкладка скрыта (document.hidden);
+// - делает один внеплановый вызов при возврате на вкладку,
+//   чтобы данные сразу актуализировались без ожидания тика.
+// Определён в app.js, который грузится раньше init.js — доступен всем скриптам.
+function setPolling(fn, ms) {
+    setInterval(() => { if (!document.hidden) fn(); }, ms);
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) fn();
+    });
+}
+
 // ==================== v8: TOP PROGRESS BAR ====================
 let activeReqs = 0;
 function ppStart() {
@@ -429,7 +442,7 @@ function initPwaMusic() {
         } catch (e) {}
     };
     upd();
-    setInterval(upd, 5000);
+    setPolling(upd, 15000);
 }
 initPwaMusic();
 

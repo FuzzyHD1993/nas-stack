@@ -4,6 +4,7 @@ go 1.27.1
 
 require (
 	github.com/FuzzyHD1993/nas-stack/internal/platform v0.0.0
+	github.com/goccy/go-json v0.10.5
 	github.com/gofiber/fiber/v3 v3.5.0
 )
 

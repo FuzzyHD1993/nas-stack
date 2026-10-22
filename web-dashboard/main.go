@@ -11,9 +11,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/goccy/go-json"
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/client"
 	"github.com/gofiber/fiber/v3/middleware/adaptor"
+	"github.com/gofiber/fiber/v3/middleware/etag"
 	"github.com/gofiber/fiber/v3/middleware/logger"
 
 	"github.com/FuzzyHD1993/nas-stack/internal/platform"
@@ -43,9 +45,30 @@ func passThroughAuth(c fiber.Ctx, header map[string]string) map[string]string {
 var proxyClient = client.New()
 
 func main() {
-	app := fiber.New()
+	// goccy/go-json: более быстрый JSON-кодек для всех c.JSON ответов.
+	app := fiber.New(fiber.Config{
+		JSONEncoder: json.Marshal,
+		JSONDecoder: json.Unmarshal,
+	})
 	platform.StartPprof()
 	app.Use(logger.New())
+	// etag ставим строго ДО setupRoutes: middleware оборачивает обработчики,
+	// и при регистрации после маршрутов он бы не срабатывал.
+	// Только /api: HTML/статика отдаются со своими заголовками кэша.
+	// Слабое кодирование не нужно — сильный ETag (Weak: false по умолчанию).
+	// Next пропускает дорогие/бинарные и потоковые ответы: хешировать тело
+	// стрима нельзя (материализует его), картинки не выигрывают на 304.
+	app.Use("/api", etag.New(etag.Config{
+		Weak: false,
+		Next: func(c fiber.Ctx) bool {
+			p := c.Path()
+			return strings.Contains(p, "/stream") ||
+				strings.Contains(p, "/subtitles") ||
+				strings.Contains(p, "/poster") ||
+				strings.Contains(p, "/thumbnail") ||
+				strings.Contains(p, "/covers/")
+		},
+	}))
 	setupRoutes(app)
 
 	staticRoot, err := fs.Sub(staticFS, "static")
