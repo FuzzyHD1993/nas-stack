@@ -12,7 +12,7 @@
 ![Redis](https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white)
 ![Grafana](https://img.shields.io/badge/Grafana-11.3-F46800?logo=grafana&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Version](https://img.shields.io/badge/version-1.8.0-blue)
+![Version](https://img.shields.io/badge/version-1.8.1-blue)
 
 ---
 
@@ -716,6 +716,8 @@ nas-stack/
 ## 🗺 Роадмап
 
 ### ✅ Сделано
+- **v1.8.1:** ETag/304 и `goccy/go-json` для API web-dashboard, снижение частоты фоновых
+  опросов и пауза при скрытой вкладке.
 - **v1.8.0:** ежедневный sync Prowlarr-определений (v11-схема + systemd-таймер), авто-старт
   торрентов при добавлении (`create_authorized` + `taskAction start`), мульти-категории
   в search/torrent-запросах, +6 русских трекеров (Catorrent, PC-torrent, RinTor.NeT,
