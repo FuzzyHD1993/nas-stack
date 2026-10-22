@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily timer for Prowlarr indexer definitions sync (GitHub mirror)
+
+[Timer]
+OnCalendar=*-*-* 04:15:00
+Persistent=true
+RandomizedDelaySec=10min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

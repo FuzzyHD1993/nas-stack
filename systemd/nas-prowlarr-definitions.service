@@ -1,0 +1,20 @@
+[Unit]
+Description=Sync Prowlarr indexer definitions from the GitHub mirror (indexers.prowlarr.com is Cloudflare-blocked on this network)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/projects/nas-stack/scripts/update-indexer-definitions.sh
+# Как и у nas-stack-watchdog: при KillMode=control-group systemd
+# SIGKILL'ит conmonлов после TimeoutStartSec, и podman restart,
+# запущенный внутри скрипта, рушит контейнер nas-prowlarr
+# на середине. KillMode=process позволяет скрипту доработать.
+KillMode=process
+# Скачивание (~741 КБ, с ретраями), возможный рестарт контейнера
+# и пробные поиски по каждому трекеру могут занять минуты.
+# Обрывать прогон по дефолтным 90 с нельзя — даём 600 с.
+TimeoutStartSec=600
+# Restart= не задаём: упавший oneshot должен повториться на
+# следующем прогоне таймера, а не зацикливаться.
+
