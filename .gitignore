@@ -45,3 +45,6 @@ host-agent/host-agent
 *.bak.*
 build/
 *.docx
+
+# Python
+__pycache__/

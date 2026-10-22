@@ -40,9 +40,14 @@
 ## ✨ Возможности
 
 ### 📥 Торренты
-- Поиск через **Prowlarr** (RuTracker, Rutor, 1337x, Byrutor, The Pirate Bay и др.)
+- Поиск через **Prowlarr** — 10+ трекеров, в т.ч. **русских**: RuTracker.org, Rutor, Byrutor,
+  Catorrent, PC-torrent, RinTor.NeT, sosulki, torrent-pirat, xxxtor (+ 1337x, TPB, Knaben, Torrent9, MagnetDownload)
 - **RuTracker без VPN** — авто-логин через FlareSolverr + cookie-сессия
+- **Определения индексаторов всегда свежие**: `scripts/update-indexer-definitions.sh`
+  (daily таймер `nas-prowlarr-definitions`, v11-схема, sha-skip, авто-рестарт Prowlarr при изменениях)
 - Управление **Synology DownloadStation**: добавление, пауза, удаление, лимит одновременных загрузок
+- **Авто-старт задач**: магнит добавляется с `create_authorized=true` + сразу стартует, id задачи резолвится автоматически
+- **Мульти-категории**: поиск и фильтры принимают несколько `categories`/`indexerIds` в одном запросе
 - **Авто-определение категории** по имени (Movies / TV / Music / Games / Courses / Books)
 - Фильтры, сортировка, статистика, детальная карточка (трекеры, файлы, ETA, рейтинг RuTracker)
 
@@ -545,10 +550,14 @@ podman compose --profile flibusta-local up -d --build
 | `scripts/smoke-test.sh` | Smoke-тест сервисов, host-демонов и инфраструктуры |
 | `scripts/btrfs-snapshot.sh` | Снапшот через `snapper` (перед обновлением) |
 | `scripts/install-systemd.sh` | Установка user-юнитов в `~/.config/systemd/user/` |
+| `scripts/update-indexer-definitions.sh` | Синхронизация Prowlarr-определений с GitHub (v11): sha-skip, бэкап, `podman cp`, рестарт только при изменениях |
+| `scripts/add-indexers.sh` | Управление индексерами Prowlarr через REST API: `list / add / test / delete` |
+| `scripts/update-rutracker-cookie.sh` | Ручная установка cookie-сессии RuTracker (fallback, если авто-логин не работает) |
 
 ```bash
 bash scripts/smoke-test.sh        # проверка всего стека (20/20)
 bash scripts/update-stack.sh      # обновление с авто-откатом
+bash scripts/update-indexer-definitions.sh --status   # только проверка (read-only)
 ```
 
 > **journald:** ограничение размера журнала задаётся в `systemd/journald-nas.conf`
@@ -572,6 +581,7 @@ systemctl --user enable --now nas-stack-watchdog.timer  # авто-рестар�
 | `nas-stack.service` | Запуск стека через `scripts/start-stack.sh` (порядок, ретраи, health-check) |
 | `nas-notify.service` | notify-service на хосте |
 | `nas-stack-watchdog.service` + `.timer` | Периодический watchdog |
+| `nas-prowlarr-definitions.service` + `.timer` | Ежедневное обновление Prowlarr-определений (04:15 ± randomized delay) |
 | `journald-nas.conf` | Лимиты журнала journald (не юнит, drop-in) |
 
 > Для ограничения журнала:
@@ -706,6 +716,10 @@ nas-stack/
 ## 🗺 Роадмап
 
 ### ✅ Сделано
+- **v1.8.0:** ежедневный sync Prowlarr-определений (v11-схема + systemd-таймер), авто-старт
+  торрентов при добавлении (`create_authorized` + `taskAction start`), мульти-категории
+  в search/torrent-запросах, +6 русских трекеров (Catorrent, PC-torrent, RinTor.NeT,
+  sosulki, torrent-pirat, xxxtor).
 - **v1.7.0:** локальный SSD-кэш фото (thumbnails/full), обновлённый роадмап.
 - **v1.6.0:** читалка FB2/EPUB (foliate-js), кэш `/stats/nas`, фикс тем, `restart-stack.sh`.
 - **v1.5.x:** фиксы foliate (`matchMedia`/`paginator`), встроенная читалка.
