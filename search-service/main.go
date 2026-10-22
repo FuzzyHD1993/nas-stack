@@ -294,11 +294,11 @@ func fetchTorrents(rctx context.Context, key, query, categories, indexerIDs stri
 	params.Set("type", "search")
 	params.Set("limit", strconv.Itoa(limit))
 	params.Set("offset", strconv.Itoa(offset))
-	if categories != "" {
-		params.Set("categories", categories)
+	for _, c := range splitIDs(categories) {
+		params.Add("categories", c)
 	}
-	if indexerIDs != "" {
-		params.Set("indexerIds", indexerIDs)
+	for _, id := range splitIDs(indexerIDs) {
+		params.Add("indexerIds", id)
 	}
 
 	var raw []map[string]any
@@ -674,6 +674,17 @@ func parseIDList(raw string, maxLen int) (string, bool) {
 		return "", false
 	}
 	return s, true
+}
+
+// splitIDs splits a validated comma-separated ID list into individual values.
+// Prowlarr expects repeated query params (categories=3000&categories=4000),
+// not a single comma-joined value.
+func splitIDs(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	return strings.Split(raw, ",")
 }
 
 func hostOf(raw string) string {

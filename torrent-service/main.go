@@ -529,6 +529,74 @@ func setDSConfig(maxDownload int) error {
 	return fmt.Errorf("NAS error: %s", string(body))
 }
 
+// createAuthorizedAdditionalJSON — значение параметра additional для create:
+// задача сразу авторизуется на скачивание (иначе DSM держит её в waiting навсегда)
+// и не переходит в seeding после завершения (сохраняем текущее поведение деплоя).
+func createAuthorizedAdditionalJSON() string {
+	return `{"download_detail":{"create_authorized":true,"seed_after_complete":false}}`
+}
+
+// parseCreatedTaskID извлекает id созданной задачи из тела ответа create.
+// DSM отвечает по-разному: {"data":{"id":"dbid_123"},"success":true},
+// {"data":{"id":["dbid_123"]},"success":true} или просто {"success":true}.
+// Возвращает "" когда id в ответе нет.
+func parseCreatedTaskID(body string) string {
+	var res struct {
+		Data struct {
+			ID interface{} `json:"id"`
+		} `json:"data"`
+		Success bool `json:"success"`
+	}
+	if err := json.Unmarshal([]byte(body), &res); err != nil {
+		return ""
+	}
+	switch v := res.Data.ID.(type) {
+	case string:
+		return v
+	case []interface{}:
+		if len(v) > 0 {
+			if s, ok := v[0].(string); ok {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+// selectCreatedTaskID выбирает из списка задач id той, что была добавлена только что:
+// uri в additional.detail совпадает, а create_time не раньше since.
+// Возвращает "" если совпадение не уникально (нет ни одной или больше одной).
+//
+// Известное ограничение точности до секунды: since — это unix-секунды, снятые
+// непосредственно ПЕРЕД вызовом create, поэтому ранее существовавшая задача с теми же
+// uri И тем же create_time (той же секундой), что и since, пройдёт проверку >= since
+// и будет выбрана, если окажется единственным совпадением по id. Это осознанно
+// принимаемая, предельно узкая гонка. Держим >= (а не >) намеренно: замена на >
+// ошибочно исключила бы задачу, реально созданную в ту же секунду, что и отметка.
+func selectCreatedTaskID(tasks []map[string]interface{}, uri string, since int64) string {
+	match := ""
+	for _, t := range tasks {
+		add, _ := t["additional"].(map[string]interface{})
+		detail, _ := add["detail"].(map[string]interface{})
+		if detail == nil {
+			continue
+		}
+		taskURI, _ := detail["uri"].(string)
+		if taskURI != uri {
+			continue
+		}
+		if create_time, _ := detail["create_time"].(float64); int64(create_time) < since {
+			continue
+		}
+		id, _ := t["id"].(string)
+		if match != "" && match != id {
+			return ""
+		}
+		match = id
+	}
+	return match
+}
+
 func addMagnetToNAS(magnet, dest string) error {
 	host := platform.GetEnv("NAS_HOST", "192.168.0.5")
 	sid, err := getSID()
@@ -544,7 +612,10 @@ func addMagnetToNAS(magnet, dest string) error {
 		"uri":         {magnet},
 		"destination": {dest},
 		"_sid":        {sid},
+		"additional":  {createAuthorizedAdditionalJSON()},
 	}
+	// Отметка ДО create — чтобы отличить новую задачу от старой с тем же uri.
+	before := time.Now().Unix()
 	resp, err := nasHTTP.PostForm(addURL, data)
 	if err != nil {
 		return fmt.Errorf("add failed: %w", err)
@@ -554,6 +625,28 @@ func addMagnetToNAS(magnet, dest string) error {
 
 	if !strings.Contains(string(bodyBytes), `"success":true`) {
 		return fmt.Errorf("NAS error: %s", string(bodyBytes))
+	}
+
+	// Задача добавлена; стартуем её best-effort. id определяем ненадёжно:
+	// сначала из ответа create, иначе ищем задачу по uri и времени создания.
+	taskID := parseCreatedTaskID(string(bodyBytes))
+	if taskID == "" {
+		tasks, lerr := listTasks()
+		if lerr != nil {
+			log.Printf("⚠️ task created, but id unknown (list failed: %v) — skip start: %s", lerr, string(bodyBytes))
+			return nil
+		}
+		taskID = selectCreatedTaskID(tasks, magnet, before)
+	}
+	if taskID == "" {
+		// Задача СОЗДАНА, но НЕ ЗАПУЩЕНА — эта функция всё равно возвращает nil.
+		// Лучший-усилий контракт старта не позволяет уронить добавление: предупреждающий
+		// лог ниже — единственный хук наблюдаемости, и это принятая последствие контракта.
+		log.Printf("⚠️ task created, but id not found — skip start: %s", string(bodyBytes))
+		return nil
+	}
+	if err := taskAction("start", taskID); err != nil {
+		log.Printf("⚠️ task start %s failed: %v (задача добавлена с create_authorized)", taskID, err)
 	}
 	return nil
 }
